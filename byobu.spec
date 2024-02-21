@@ -13,7 +13,7 @@ License:	GPLv3
 URL:		https://github.com/dustinkirkland/byobu
 Source0:    https://github.com/dustinkirkland/byobu/archive/refs/tags/%{version}.tar.gz
 # default windows
-Source1:	https://src.fedoraproject.org/fork/faramirza/rpms/byobu/blob/rawhide/f/fedoracommon
+Source1:	https://src.fedoraproject.org/rpms/byobu/blob/rawhide/f/fedoracommon
 
 # prefer dnf when installed
 # sent upstream: https://code.launchpad.net/~sanjay-ankur/byobu/byobu/+merge/415959
