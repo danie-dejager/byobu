@@ -6,7 +6,7 @@
 
 Name:		byobu
 Version:	6.12
-Release:	2%{?dist}
+Release:	3%{?dist}
 Summary:	Light-weight, configurable window manager built upon GNU screen
 
 License:	GPLv3
@@ -127,7 +127,9 @@ cp -p usr/share/byobu/pixmaps/byobu.svg %{buildroot}%{_iconsscaldir}
 %config(noreplace) %{_sysconfdir}/%{name}/*
 
 %changelog
-* Tue Jul 24 2024 Danie de Jager - 6.12-2
+* Tue Dec 17 2024 - Danie de Jager - 6.12-3
+
+* Tue Jul 24 2024 - Danie de Jager - 6.12-2
 
 * Sun Feb 18 2024 Filipe Rosset <rosset.filipe@gmail.com> - 6.12-1
 - Update byobu to 6.12
