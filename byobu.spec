@@ -5,8 +5,8 @@
 %define _iconsscaldir  %{_iconsbasedir}/scalable/apps
 
 Name:		byobu
-Version:	6.12
-Release:	3%{?dist}
+Version:	6.13
+Release:	1%{?dist}
 Summary:	Light-weight, configurable window manager built upon GNU screen
 
 License:	GPLv3
@@ -127,6 +127,8 @@ cp -p usr/share/byobu/pixmaps/byobu.svg %{buildroot}%{_iconsscaldir}
 %config(noreplace) %{_sysconfdir}/%{name}/*
 
 %changelog
+* Fri Apr 11 2025 - Danie de Jager - 6.13-1
+
 * Tue Dec 17 2024 - Danie de Jager - 6.12-3
 
 * Tue Jul 24 2024 - Danie de Jager - 6.12-2
