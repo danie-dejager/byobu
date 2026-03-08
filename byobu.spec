@@ -125,6 +125,7 @@ cp -p usr/share/byobu/pixmaps/byobu.svg %{buildroot}%{_iconsscaldir}
 %{_mandir}/man1/wifi-status.1.gz
 %{_libexecdir}/%{name}/*
 %config(noreplace) %{_sysconfdir}/%{name}/*
+%{_datadir}/sounds/byobu/byobu.ogg
 
 %changelog
 * Sun Mar 8 2026 - Danie de Jager - 6.14-1
