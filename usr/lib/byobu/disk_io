@@ -35,8 +35,22 @@ getdisk() {
 	else
 		t="$1"
 	fi
-	t="${t##*/}";
-	[ -h "/sys/block/$t" ] && _RET="$t" || rtrim "$t" "0-9"
+	t="${t##*/}"
+	# If it's already a block device, use it as-is
+	if [ -h "/sys/block/$t" ]; then
+		_RET="$t"
+	else
+		# Strip partition number (trailing digits)
+		rtrim "$t" "0-9"
+		t="$_RET"
+		# For NVMe (nvme0n1p2), MMC (mmcblk0p2), etc., also strip the 'p'
+		# that precedes the partition number. If it ends with 'p' after
+		# removing digits, it's likely this naming scheme.
+		case "$t" in
+			*p) _RET="${t%p}" ;;
+			*) _RET="$t" ;;
+		esac
+	fi
 }
 
 __disk_io() {
@@ -54,6 +68,7 @@ __disk_io() {
 	getdisk "$part"
 	local disk=${_RET}
 	local t2=$(date +%s) t1=
+	local over_threshold=0
 	for i in "read" "write"; do
 		local cache="$BYOBU_RUN_DIR/cache.$BYOBU_BACKEND/disk.$i"
 		t1=$(stat -c %Y "$cache") 2>/dev/null || t1=0
@@ -72,12 +87,9 @@ __disk_io() {
 				symbol="$ICON_WR"
 				[ -n "$a7" ] && x2="$a7" || x2=0
 			fi
-			printf "%s" "$x2" > "$cache"
+			printf "%s\n" "$x2" > "$cache"
 			rate=$((($x2 - $x1) / ($t2 - $t1) * 512 / 1024))
-			if [ $rate -lt $DISK_IO_THRESHOLD ]; then
-				# Below threshold, don't print
-				continue
-			elif [ "$rate" -lt 0 ]; then
+			if [ "$rate" -lt 0 ]; then
 				rate=0
 			elif [ "$rate" -gt 1048576 ]; then
 				unit="GB/s"
@@ -91,12 +103,14 @@ __disk_io() {
 				unit="kB/s"
 			fi
 		fi
-		if [ -z "$rate" ] || [ "$rate" = "0" ]; then
-			rm -f "$BYOBU_RUN_DIR/status.$BYOBU_BACKEND/disk_io"*
-		else
+		if [ -n "$rate" ] && [ "$rate" != "0" ] && [ $rate -ge $DISK_IO_THRESHOLD ]; then
+			over_threshold=1
 			color b M W; printf "%s%s" "$symbol" "$rate"; color -; color M W; printf "%s" "$unit"; color --
 		fi
 	done
+	if [ "$over_threshold" = "0" ]; then
+		rm -f "$BYOBU_RUN_DIR/status.$BYOBU_BACKEND/disk_io"*
+	fi
 }
 
 # vi: syntax=sh ts=4 noexpandtab

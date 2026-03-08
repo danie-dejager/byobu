@@ -1,3 +1,112 @@
+byobu (6.16-0ubuntu1) UNRELEASED; urgency=medium
+
+  * usr/share/man/man1/byobu.1:
+    - add STATUS ICONS section documenting Unicode and ASCII icons
+    - clarifies meaning of symbols like ⚠, ⟳, ‼, and 🗹
+    - https://github.com/dustinkirkland/byobu/issues/79
+  * usr/bin/byobu-launcher.in:
+    - prevent nested tmux sessions when Fish shell (or other shells) already run tmux
+    - fixes "sessions should be nested with care" error on login
+    - https://github.com/dustinkirkland/byobu/issues/76
+  * usr/lib/byobu/include/select-session.py:
+    - fix byobu-select-session filtering out hyphenated session names
+    - remove overly broad hyphen check that broke sessions like "project-foo-bar"
+  * debian/po/sv.po:
+    - add Swedish translation for Debian installation templates
+    - thanks to Luna Jernberg for the translation
+
+ -- Dustin Kirkland <dustin.kirkland@chainguard.dev>  Sat, 15 Feb 2026 19:30:00 -0600
+
+byobu (6.15) released; urgency=medium
+
+  * usr/lib/byobu/disk_io:
+    - fix stale disk_io status notifications when I/O drops below threshold
+    - fix crash on NVMe and MMC devices due to partition naming (nvme0n1p2)
+    - fix cache read failure causing incorrect statistics display
+    - LP: #1658524
+    - Closes: #992984
+  * usr/lib/byobu/users:
+    - fix trailing hash display for screen backend (tmux needs ##, screen needs #)
+  * usr/lib/byobu/memory:
+    - add FreeBSD support using sysctl for memory statistics
+  * usr/lib/byobu/fan_speed:
+    - fix fan speed stuck at last non-zero value when dropping to 0 RPM
+    - LP: #1897540
+  * usr/lib/byobu/cpu_freq:
+    - add dmidecode fallback for zero bogomips CPUs (Ampere Altra processors)
+    - LP: #2051288
+  * usr/bin/byobu-shell.in:
+    - fix infinite loop with fish shell autostart
+    - LP: #2064030
+  * usr/bin/purge-old-kernels:
+    - note: this script was already deprecated/simplified to call apt autoremove
+    - Closes: #935681
+  * Document bash requirement for decimal sleep values:
+    - add bash to Depends in debian/control
+    - change shebang to #!/bin/bash in scripts using decimal sleep
+    - add documentation comments explaining necessity of decimal sleeps
+    - fixes: hostname, ip_address, shutil, byobu-launch.in
+    - Closes: #772221
+
+ -- Dustin Kirkland <dustin.kirkland@chainguard.dev>  Sun, 15 Feb 2026 17:08:47 -0600
+
+byobu (6.14-0ubuntu1) resolute; urgency=medium
+
+  * usr/share/byobu/profiles/bashrc:
+    - don't output byobu_prompt_runtime to stderr
+    - fixes Ubuntu #2067490
+    - https://github.com/dustinkirkland/byobu/pull/68
+    - only set PS0 when BYOBU_RUN_DIR exists (prevents errors outside byobu)
+    - https://github.com/dustinkirkland/byobu/issues/75
+  * usr/bin/byobu-layout.in:
+    - fix expr: syntax error by removing duplicate variable declaration
+    - https://github.com/dustinkirkland/byobu/pull/63
+  * usr/share/byobu/keybindings/f-keys.tmux:
+    - prevent help screen from disappearing if user has set $LESS
+    - https://github.com/dustinkirkland/byobu/pull/64
+  * README.md:
+    - fix typo: INSTALATION -> INSTALLATION
+    - https://github.com/dustinkirkland/byobu/pull/67
+    - fix installation instructions to use ./autogen.sh instead of ./debian/rules
+    - works without debhelper/root access, fixes syntax error
+    - addresses issue raised in https://github.com/dustinkirkland/byobu/pull/86
+    - update git clone URL from git:// to https:// (git:// protocol disabled by GitHub)
+    - https://github.com/dustinkirkland/byobu/issues/72
+  * configure.ac, usr/bin/byobu.in:
+    - use autoconf @VERSION@ substitution for consistent version management
+    - https://github.com/dustinkirkland/byobu/pull/70
+  * usr/bin/byobu.in:
+    - extend home directory ownership test for non-standard setups
+    - allows byobu to work in networked environments where $HOME is root-owned
+    - https://github.com/dustinkirkland/byobu/pull/55
+  * usr/lib/byobu/services:
+    - add systemd support to services status script
+    - now checks systemd before falling back to upstart/sysvinit
+    - https://github.com/dustinkirkland/byobu/pull/42
+  * usr/lib/byobu/ip_address:
+    - use OpenDNS for faster external IP detection when dig is available
+    - falls back to ipv6-test.com if dig is unavailable or fails
+    - based on https://github.com/dustinkirkland/byobu/pull/36
+  * usr/lib/byobu/logo:
+    - add Oracle Linux logo support
+    - https://github.com/dustinkirkland/byobu/pull/74
+  * Makefile.am, configure.ac, */Makefile.am:
+    - add automake dist_ directives for proper distribution tarball creation
+    - fixes "make distclean" to create buildable distributions
+    - https://github.com/dustinkirkland/byobu/pull/69
+  * usr/lib/byobu/include/common:
+    - fix byobu -v not producing output when file ends with case block
+    - add true statement after esac to restore stdout
+    - https://github.com/dustinkirkland/byobu/issues/83
+  * usr/lib/byobu/updates_available:
+    - fix Arch Linux updates detection to check pacman.log for installed packages
+    - prevents false positive "updates available" after packages are installed
+    - https://github.com/dustinkirkland/byobu/issues/73
+  * usr/bin/byobu-shell.in:
+    - update bit.ly/byobu-tips URL to https://byobu.org
+
+ -- Dustin Kirkland <kirkland@ubuntu.com>  Sat, 14 Feb 2026 20:27:44 -0600
+
 byobu (6.13-0ubuntu1) plucky; urgency=medium
 
   * usr/lib/byobu/include/common:

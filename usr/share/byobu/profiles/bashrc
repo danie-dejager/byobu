@@ -53,10 +53,11 @@ byobu_prompt_runtime() {
 	[ "$hours" = "0" ] && hours= || hours="${hours}h "
 	[ "$minutes" = "0" ] && minutes= || minutes="${minutes}m "
 	str="${days}${hours}${minutes}${seconds}.${microseconds}s"
-	printf "[%s]" "$str" 1>&2
+	printf "[%s]" "$str"
 }
 # Requires Bash 4.x
-export PS0='$(printf "%s" ${EPOCHREALTIME/[^0-9]/} >"$BYOBU_RUN_DIR/timer.$$")'
+# Only set PS0 if BYOBU_RUN_DIR is set (i.e., inside byobu)
+[ -d "$BYOBU_RUN_DIR" ] && export PS0='$(printf "%s" ${EPOCHREALTIME/[^0-9]/} >"$BYOBU_RUN_DIR/timer.$$")'
 
 case "$BYOBU_DISTRO" in
 	"Ubuntu")
