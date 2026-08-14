@@ -162,8 +162,3 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/%{name}.desktop
 %{_datadir}/trustmux/static/trustmux.svg
 %{_datadir}/trustmux/static/icons/icon-192.png
 %{_datadir}/trustmux/static/icons/icon-512.png
-
-
-* Wed Jun 10 2026 Dustin Kirkland <dustin.kirkland@gmail.com> - 7.11-1
-- Update to 7.11; add trustmux files; import spec from Fedora dist-git
-  (maintained by Filipe Rosset <rosset.filipe@gmail.com>)
