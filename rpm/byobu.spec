@@ -4,7 +4,7 @@
 %global trustmuxlibdir %{_prefix}/lib/trustmux
 
 Name:		byobu
-Version:	7.15
+Version:	7.17
 Release:	1%{?dist}
 Summary:	Light-weight, configurable window manager built upon GNU screen
 
@@ -163,14 +163,6 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/%{name}.desktop
 %{_datadir}/trustmux/static/icons/icon-192.png
 %{_datadir}/trustmux/static/icons/icon-512.png
 
-
-%changelog
-* Fri Jul 17 2026 Dustin Kirkland <dustin.kirkland@gmail.com> - 7.15-1
-- Update to 7.15; see the upstream ChangeLog for full details. Highlights
-  since 7.11: trustmux security hardening (WebSocket revocation on unpair,
-  shorter pairing-code TTL, TLS 1.3 minimum, raised dependency floors),
-  PWA fixes (OSC-8 hyperlink parsing, scroll position, on-screen keyboard
-  layout, password keyboard mode), and refusing to run trustmux as root.
 
 * Wed Jun 10 2026 Dustin Kirkland <dustin.kirkland@gmail.com> - 7.11-1
 - Update to 7.11; add trustmux files; import spec from Fedora dist-git
