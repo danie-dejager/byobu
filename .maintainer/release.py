@@ -2095,6 +2095,33 @@ def push_salsa(v, identity):
 
 # ── summary ───────────────────────────────────────────────────────────────
 
+def offer_local_install(debs):
+    """Offer to install the just-built .deb(s) right after showing the
+    command for it -- saves retyping it when testing the build on this
+    same machine, which is the common case right after an rc/final build.
+
+    Deliberately independent of --interactive/-i: that flag gates
+    confirmations *within* the pipeline (each phase asking "proceed?"),
+    while this is a one-off convenience question after the pipeline has
+    already fully succeeded, so it always asks. Defaults to No, matching
+    confirm()'s convention that a system-modifying action needs an
+    explicit yes -- and unlike confirm(), a "no" here just skips the
+    install rather than aborting anything, since there's nothing left to
+    abort.
+    """
+    try:
+        ans = input("\n  Install now? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans not in ("y", "yes"):
+        return
+    # check=False: a failed install (e.g. a dependency gap) shouldn't read
+    # as the release itself having failed -- the build already succeeded
+    # and the command above is still there to retry by hand.
+    run(["sudo", "dpkg", "-i", *(str(d) for d in debs)], check=False)
+
+
 def print_summary(v, mode):
     outdir = v["outdir"]
     mode_label = "RC" if mode == "rc" else "Release"
@@ -2129,6 +2156,7 @@ def print_summary(v, mode):
     if debs:
         print(f"\n  Local install:")
         print(f"    sudo dpkg -i " + " ".join(str(d) for d in debs))
+        offer_local_install(debs)
 
     if mode == "final":
         print("  Next: run ./release.py open-dev to bump version and open development.\n")
