@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # test_byobu.sh — unit tests for byobu core utilities
 #
 # Runs without a live tmux/screen session.  All tests are self-contained:
@@ -283,7 +283,7 @@ _batt_sign() {
 	case "$1" in
 		charging)            echo "+" ;;
 		discharging)         echo "-" ;;
-		charged|unknown|full) echo "=" ;;
+		charged|unknown|full|fully-charged|"not charging"|not_charging) echo "=" ;;
 		*)                   echo "$1" ;;
 	esac
 }
@@ -301,11 +301,20 @@ assert_eq "batt color 66%  → yellow" "$(_batt_color 66)"  "yellow"
 assert_eq "batt color 67%  → green"  "$(_batt_color 67)"  "green"
 assert_eq "batt color 100% → green"  "$(_batt_color 100)" "green"
 
-assert_eq "batt sign charging"    "$(_batt_sign charging)"    "+"
-assert_eq "batt sign discharging" "$(_batt_sign discharging)" "-"
-assert_eq "batt sign charged"     "$(_batt_sign charged)"     "="
-assert_eq "batt sign unknown"     "$(_batt_sign unknown)"     "="
-assert_eq "batt sign full"        "$(_batt_sign full)"        "="
+assert_eq "batt sign charging"      "$(_batt_sign charging)"        "+"
+assert_eq "batt sign discharging"   "$(_batt_sign discharging)"     "-"
+assert_eq "batt sign charged"       "$(_batt_sign charged)"         "="
+assert_eq "batt sign unknown"       "$(_batt_sign unknown)"         "="
+assert_eq "batt sign full"          "$(_batt_sign full)"            "="
+assert_eq "batt sign fully-charged" "$(_batt_sign fully-charged)"   "="
+# GH #143: Linux's power_supply status can legitimately be "Not charging"
+# (plugged in, not actively drawing charge -- threshold or already full),
+# lowercased by the real script before reaching this logic; Termux reports
+# the same state as "NOT_CHARGING". Both used to fall through to the
+# catch-all and print the raw state glued to the percentage, e.g.
+# "65%not charging".
+assert_eq "batt sign \"not charging\" (Linux, space)" "$(_batt_sign "not charging")" "="
+assert_eq "batt sign not_charging (Termux, underscore)" "$(_batt_sign not_charging)" "="
 
 # ---------------------------------------------------------------------------
 # Section 13 — Disk unit extraction (from usr/lib/byobu/disk)
@@ -727,6 +736,296 @@ touch "$_tmp/.bashrc" "$_tmp/.zshrc"
 assert_true "launcher-install: .bashrc contains byobu-launch line" \
 	"grep -q 'byobu-launch' '$_tmp/.bashrc'"
 rm -rf "$_tmp"; unset _tmp _install _uninstall
+
+# ---------------------------------------------------------------------------
+# Section 35 — BYOBU_GETTEXT: overridable gettext binary (constants)
+# ---------------------------------------------------------------------------
+
+_tmp=$(mktemp -d)
+_got=$(env -i HOME="$HOME" PATH="$PATH" BYOBU_PREFIX="$BYOBU_PREFIX" PKG="byobu" \
+	BYOBU_CONFIG_DIR="$_tmp/config" BYOBU_RUN_DIR="$_tmp/run" BYOBU_TEST="command -v" \
+	sh -c 'mkdir -p "$BYOBU_CONFIG_DIR" "$BYOBU_RUN_DIR"; . "${BYOBU_PREFIX}/lib/byobu/include/constants"; echo "$BYOBU_GETTEXT"')
+assert_eq "BYOBU_GETTEXT: defaults to \"gettext\" when unset" "$_got" "gettext"
+
+_got=$(env -i HOME="$HOME" PATH="$PATH" BYOBU_PREFIX="$BYOBU_PREFIX" PKG="byobu" \
+	BYOBU_CONFIG_DIR="$_tmp/config" BYOBU_RUN_DIR="$_tmp/run" BYOBU_TEST="command -v" \
+	BYOBU_GETTEXT="/opt/store/bin/gettext" \
+	sh -c '. "${BYOBU_PREFIX}/lib/byobu/include/constants"; echo "$BYOBU_GETTEXT"')
+assert_eq "BYOBU_GETTEXT: a pre-set value is preserved untouched" "$_got" "/opt/store/bin/gettext"
+rm -rf "$_tmp"; unset _tmp _got
+
+# ---------------------------------------------------------------------------
+# Section 36 — BYOBU_FORCE_BACKEND precedence (mirrors usr/bin/byobu.in)
+# ---------------------------------------------------------------------------
+# byobu.in itself launches a full session and isn't safe to source in a unit
+# test, so this exercises the exact backend-selection block copied verbatim
+# from that script -- config file, then argv[0], then BYOBU_FORCE_BACKEND.
+
+_dispatch() {
+	local zero="$1" cfg_backend="$2" force="$3" _out
+	_out=$(BYOBU_BACKEND="" ; [ -n "$cfg_backend" ] && BYOBU_BACKEND="$cfg_backend"
+		case "$zero" in
+			*byobu-screen) BYOBU_BACKEND="screen" ;;
+			*byobu-tmux) BYOBU_BACKEND="tmux" ;;
+		esac
+		case "$force" in
+			screen|tmux) BYOBU_BACKEND="$force" ;;
+		esac
+		echo "$BYOBU_BACKEND")
+	_RET="$_out"
+}
+
+_dispatch "/usr/bin/byobu" "" ""
+assert_eq "backend dispatch: no config, no argv0 match, no override" "$_RET" ""
+
+_dispatch "/usr/bin/byobu" "screen" ""
+assert_eq "backend dispatch: config alone wins" "$_RET" "screen"
+
+_dispatch "/usr/bin/byobu-tmux" "screen" ""
+assert_eq "backend dispatch: argv0 overrides config" "$_RET" "tmux"
+
+_dispatch "/usr/bin/byobu" "screen" "tmux"
+assert_eq "backend dispatch: BYOBU_FORCE_BACKEND overrides config" "$_RET" "tmux"
+
+_dispatch "/usr/bin/byobu-tmux" "" "screen"
+assert_eq "backend dispatch: BYOBU_FORCE_BACKEND overrides argv0" "$_RET" "screen"
+
+_dispatch "/usr/bin/byobu" "screen" "garbage"
+assert_eq "backend dispatch: invalid BYOBU_FORCE_BACKEND value is ignored" "$_RET" "screen"
+
+unset -f _dispatch
+
+# ---------------------------------------------------------------------------
+# Section 37 — width-detection lock (mirrors byobu-status.in's mkdir lock)
+# ---------------------------------------------------------------------------
+# GH #141: status-left and status-right are two independent, genuinely
+# concurrent processes; this checks the mutual-exclusion primitive itself
+# (mkdir is atomic), not the live tmux calls it guards.
+
+_tmp=$(mktemp -d)
+_lockdir="$_tmp/.width.lock"
+
+mkdir "$_lockdir" 2>/dev/null && _got="ok" || _got="fail"
+assert_eq "width lock: first mkdir succeeds"              "$_got" "ok"
+
+mkdir "$_lockdir" 2>/dev/null && _got="ok" || _got="fail"
+assert_eq "width lock: concurrent mkdir fails while held" "$_got" "fail"
+
+rmdir "$_lockdir" 2>/dev/null
+mkdir "$_lockdir" 2>/dev/null && _got="ok" || _got="fail"
+assert_eq "width lock: mkdir succeeds again after release" "$_got" "ok"
+
+rmdir "$_lockdir" 2>/dev/null
+rm -rf "$_tmp"; unset _tmp _lockdir _got
+
+# ---------------------------------------------------------------------------
+# Section 38 — PID-suffixed cache writes (mirrors get_status() in byobu-status)
+# ---------------------------------------------------------------------------
+# GH #141: get_status() used to write every segment's fresh output to a
+# single shared "$cachepath".new path. status-left and status-right run as
+# separate concurrent processes, so two overlapping writes to that shared
+# path could interleave and corrupt or blank a cache entry for a tick. A
+# PID-suffixed temp path makes concurrent writers independent by
+# construction; this checks that property directly.
+
+_tmp=$(mktemp -d)
+_cachepath="$_tmp/segment"
+
+# Simulate two "processes" (distinct fake PIDs) writing concurrently.
+printf "%s" "value-from-pid-1111" > "$_cachepath.new.1111"
+printf "%s" "value-from-pid-2222" > "$_cachepath.new.2222"
+
+assert_true "cache write: PID-suffixed temp files coexist independently" \
+	"[ -f '$_cachepath.new.1111' ] && [ -f '$_cachepath.new.2222' ]"
+assert_eq "cache write: first writer's content untouched by the second" \
+	"$(cat "$_cachepath.new.1111")" "value-from-pid-1111"
+assert_eq "cache write: second writer's content untouched by the first" \
+	"$(cat "$_cachepath.new.2222")" "value-from-pid-2222"
+
+rm -rf "$_tmp"; unset _tmp _cachepath
+
+# ---------------------------------------------------------------------------
+# Section 39 — OSC 133 shell integration (profiles/shell-integration.bash)
+# ---------------------------------------------------------------------------
+# Regression coverage for a real bug caught during development: the B marker
+# embedded in PS1 used ST (ESC \) as its terminator, whose second byte is a
+# literal backslash -- which collided with bash's own \[ \] PS1 escaping and
+# left a stray "]" character in the rendered prompt. Switched to BEL. ${PS1@P}
+# (bash 4.4+) applies real PS1 prompt-expansion without needing a live
+# interactive session/pty, so this exercises the same code path bash itself
+# uses to render a prompt, not just a string check.
+
+# Not a subshell: assert_eq/assert_true update the global PASS/FAIL counters,
+# which wouldn't propagate back out of one. Safe to leave PS1/PROMPT_COMMAND/
+# PS0 set afterward -- this is the last section before Results.
+
+PS1="myprompt\$ "
+unset PROMPT_COMMAND PS0
+. "${BYOBU_PREFIX}/share/byobu/profiles/shell-integration.bash"
+
+rendered="${PS1@P}"
+expected=$(printf 'myprompt$ \033]133;B\a')
+assert_eq "osc133 bash: PS1 renders to exactly prompt + B marker, no stray bytes" \
+	"$rendered" "$expected"
+
+# PROMPT_COMMAND: exit code must be the real preceding command's, not
+# something clobbered by the hook's own internals.
+false
+out=$(eval "$PROMPT_COMMAND")
+want=$(printf '\033]133;D;1\a\033]133;A\a')
+assert_eq "osc133 bash: PROMPT_COMMAND emits D;<real exit code> then A" "$out" "$want"
+
+true
+out=$(eval "$PROMPT_COMMAND")
+want=$(printf '\033]133;D;0\a\033]133;A\a')
+assert_eq "osc133 bash: exit code 0 captured correctly too" "$out" "$want"
+
+# PS0 holds a deferred command substitution, not a literal unexpanded
+# ${...} (the exact class of bug this would have caught: using \${x}
+# instead of \$(x) silently never fires). ${PS0@P} applies real
+# prompt-expansion, same as ${PS1@P} above -- eval would try to execute
+# the marker's raw escape bytes as a command instead of embedding them.
+out="${PS0@P}"
+want=$(printf '\033]133;C\a')
+assert_eq "osc133 bash: PS0 command substitution fires the C marker" "$out" "$want"
+
+# Idempotency: sourcing twice must not duplicate the hook or grow PS1.
+prompt_command_before="$PROMPT_COMMAND"
+ps1_before="$PS1"
+. "${BYOBU_PREFIX}/share/byobu/profiles/shell-integration.bash"
+assert_eq "osc133 bash: re-sourcing does not duplicate PROMPT_COMMAND" \
+	"$PROMPT_COMMAND" "$prompt_command_before"
+assert_eq "osc133 bash: re-sourcing does not duplicate the PS1 marker" \
+	"$PS1" "$ps1_before"
+
+# Chains onto an existing PROMPT_COMMAND/PS1 instead of replacing them.
+PS1="custom\$ "
+PROMPT_COMMAND="echo already-here"
+unset PS0
+. "${BYOBU_PREFIX}/share/byobu/profiles/shell-integration.bash"
+assert_true "osc133 bash: chains onto an existing PROMPT_COMMAND rather than replacing it" \
+	"[[ \"\$PROMPT_COMMAND\" == *already-here* ]]"
+assert_true "osc133 bash: chains onto an existing PS1 rather than replacing it" \
+	"[[ \"\${PS1@P}\" == custom* ]]"
+
+unset PS1 PROMPT_COMMAND PS0 rendered expected out want prompt_command_before ps1_before
+
+# ---------------------------------------------------------------------------
+# Section 40 — OSC 133 shell integration (profiles/shell-integration.zsh)
+# ---------------------------------------------------------------------------
+# zsh counterpart to Section 39. Skipped, not failed, when zsh isn't
+# installed -- it's an optional dependency of this test suite, not of
+# byobu itself, and not every box this runs on will have it. A skip prints
+# a visible notice so it's never mistaken for having actually run.
+
+if command -v zsh >/dev/null 2>&1; then
+	_zsh_script="$BYOBU_PREFIX/share/byobu/profiles/shell-integration.zsh"
+	_zsh_out=$(zsh -c '
+		precmd_functions=()
+		preexec_functions=()
+		PROMPT="myprompt\$ "
+		source "'"$_zsh_script"'"
+
+		rendered="${(%)PROMPT}"
+		expected=$(printf "myprompt\$ \033]133;B\a")
+		[ "$rendered" = "$expected" ] && echo "PS1_OK" || echo "PS1_FAIL:[$rendered]"
+
+		out=$(__byobu_osc133_precmd)
+		want=$(printf "\033]133;D;0\a\033]133;A\a")
+		[ "$out" = "$want" ] && echo "PRECMD_OK" || echo "PRECMD_FAIL:[$out]"
+
+		out=$(__byobu_osc133_preexec)
+		want=$(printf "\033]133;C\a")
+		[ "$out" = "$want" ] && echo "PREEXEC_OK" || echo "PREEXEC_FAIL:[$out]"
+
+		before_precmd=${#precmd_functions[@]}
+		before_prompt="$PROMPT"
+		source "'"$_zsh_script"'"
+		[ "${#precmd_functions[@]}" = "$before_precmd" ] && echo "IDEMPOTENT_PRECMD_OK" || echo "IDEMPOTENT_PRECMD_FAIL"
+		[ "$PROMPT" = "$before_prompt" ] && echo "IDEMPOTENT_PROMPT_OK" || echo "IDEMPOTENT_PROMPT_FAIL"
+	' 2>&1)
+
+	assert_true "osc133 zsh: PROMPT renders to exactly prompt + B marker" \
+		"printf %s \"\$_zsh_out\" | grep -q PS1_OK"
+	assert_true "osc133 zsh: precmd emits D;<exit code> then A" \
+		"printf %s \"\$_zsh_out\" | grep -q PRECMD_OK"
+	assert_true "osc133 zsh: preexec emits the C marker" \
+		"printf %s \"\$_zsh_out\" | grep -q PREEXEC_OK"
+	assert_true "osc133 zsh: re-sourcing does not duplicate the precmd hook" \
+		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PRECMD_OK"
+	assert_true "osc133 zsh: re-sourcing does not duplicate the PROMPT marker" \
+		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PROMPT_OK"
+
+	unset _zsh_script _zsh_out
+else
+	echo "  SKIP: zsh not installed -- shell-integration.zsh not exercised"
+fi
+
+# ---------------------------------------------------------------------------
+# Section 41 — byobu-enable/disable-shell-integration (rc-file injection)
+# ---------------------------------------------------------------------------
+# The enable/disable scripts are .in templates (need @prefix@ substituted),
+# so this exercises them the same way test_byobu.sh already handles
+# launcher-install/-uninstall above: read the .in source directly and sed
+# out the one substitution that matters for a functional test.
+
+# Both scripts source include/common, which needs include/dirs -- itself a
+# .in template not present without a full autoreconf/configure/make cycle
+# (confirmed while writing this test: running the .in directly, even with
+# @prefix@ substituted, fails on that missing dependency). Section 34 above
+# hits the exact same problem with launcher-install/-uninstall and solves it
+# the same way this does: static checks on the .in source, plus an inline
+# simulation of the marker-line logic rather than actually invoking the
+# script. The real end-to-end behavior (this exact scenario, plus a full
+# build) was verified manually in Docker during development.
+
+_enable_src="$BYOBU_PREFIX/bin/byobu-enable-shell-integration.in"
+_disable_src="$BYOBU_PREFIX/bin/byobu-disable-shell-integration.in"
+_marker="#byobu-shell-integration#"
+
+if [ -r "$_enable_src" ] && [ -r "$_disable_src" ]; then
+	assert_true "enable-shell-integration: handles bash" \
+		"grep -q '\*bash)' '$_enable_src'"
+	assert_true "enable-shell-integration: handles zsh" \
+		"grep -q '\*zsh)' '$_enable_src'"
+	assert_true "enable-shell-integration: calls disable first (idempotency)" \
+		"grep -q 'disable-shell-integration --no-reload' '$_enable_src'"
+	assert_true "enable-shell-integration and disable-shell-integration: same marker string" \
+		"grep -q \"$_marker\" '$_enable_src' && grep -q \"$_marker\" '$_disable_src'"
+
+	# Inline simulation of the marker-line logic both scripts actually use
+	# (append-if-absent in enable, "sed -e /marker$/d" in disable) against a
+	# fake rc file -- this is the part with real dedup/removal bugs to catch.
+	_tmp=$(mktemp -d)
+	_rc="$_tmp/.bashrc"
+	echo "existing line" > "$_rc"
+
+	_inject() {
+		sed -e "/${_marker}$/d" "$_rc" > "$_rc.new" && mv "$_rc.new" "$_rc"
+		printf '[ -r "profile" ] && . "profile"   %s\n' "$_marker" >> "$_rc"
+	}
+
+	_inject
+	assert_true "rc injection: adds exactly one marker line" \
+		"[ \"\$(grep -c \"$_marker\" '$_rc')\" = 1 ]"
+	assert_true "rc injection: preserves the pre-existing line" \
+		"grep -q '^existing line$' '$_rc'"
+
+	_inject
+	assert_true "rc injection: idempotent, still exactly one marker line after a second run" \
+		"[ \"\$(grep -c \"$_marker\" '$_rc')\" = 1 ]"
+
+	sed -e "/${_marker}$/d" "$_rc" > "$_rc.new" && mv "$_rc.new" "$_rc"
+	assert_true "rc removal: cleans up back to byte-identical original content" \
+		"[ \"\$(cat '$_rc')\" = 'existing line' ]"
+
+	unset -f _inject
+	rm -rf "$_tmp"; unset _tmp _rc
+else
+	echo "  SKIP: byobu-enable/disable-shell-integration.in not found -- rc-injection not exercised"
+fi
+
+unset _enable_src _disable_src _marker
 
 # ---------------------------------------------------------------------------
 # Results

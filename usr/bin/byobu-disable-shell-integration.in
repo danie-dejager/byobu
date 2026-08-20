@@ -1,8 +1,7 @@
 #!/bin/sh -e
 #
-#    byobu-export
-#    Copyright (C) 2008-2010 Canonical Ltd.
-#    Copyright (C) 2023 Dustin Kirkland <dustin.kirkland@gmail.com>
+#    byobu-disable-shell-integration
+#    Copyright (C) 2026 Dustin Kirkland
 #
 #    Authors: Dustin Kirkland <kirkland@byobu.org>
 #
@@ -23,21 +22,22 @@ PKG="byobu"
 [ -z "${BYOBU_PREFIX}" ] && export BYOBU_PREFIX="@prefix@" || export BYOBU_PREFIX
 . "${BYOBU_PREFIX}/lib/${PKG}/include/common"
 
-if eval $BYOBU_TEST $BYOBU_GETTEXT >/dev/null 2>&1; then
-	command=$BYOBU_GETTEXT
-else
-	command=echo
+marker="#byobu-shell-integration#"
+
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+	[ -w "$rc" ] || continue
+	$BYOBU_SED_INLINE -e "/${marker}$/d" "$rc"
+done
+
+if [ "$1" != "--no-reload" ]; then
+	if [ -n "$TMUX" ]; then
+		tmux send-keys " . ~/.${SHELL##*/}rc" \; send-keys Enter
+	else
+		echo
+		echo "You will need to reload your shell configuration for this to take effect..."
+		echo "  . ~/.${SHELL##*/}rc"
+		echo
+	fi
 fi
-
-$command "
-The byobu-export utility is now deprecated.
-
-To install byobu on a system for which byobu is not packaged, or
-where you are not the root user, simply:
- * Download the latest release (>= 3.0) from:
-    https://github.com/dustinkirkland/byobu
- * And follow the instructions in the README
-
-"
 
 # vi: syntax=sh ts=4 noexpandtab

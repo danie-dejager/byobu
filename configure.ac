@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([byobu], [7.18], [https://byobu.org])
+AC_INIT([byobu], [7.19], [https://byobu.org])
 AC_CONFIG_SRCDIR([usr/bin/byobu.in])
 AM_INIT_AUTOMAKE([foreign])
 AC_PROG_LN_S
@@ -37,8 +37,10 @@ AC_OUTPUT(Makefile \
 	usr/bin/byobu-ctrl-a \
 	usr/bin/byobu-disable \
 	usr/bin/byobu-disable-prompt \
+	usr/bin/byobu-disable-shell-integration \
 	usr/bin/byobu-enable \
 	usr/bin/byobu-enable-prompt \
+	usr/bin/byobu-enable-shell-integration \
 	usr/bin/byobu-export \
 	usr/bin/byobu-janitor \
 	usr/bin/byobu-launch \

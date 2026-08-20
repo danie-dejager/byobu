@@ -192,6 +192,7 @@ const btnPrev          = document.getElementById('btn-prev');
 const btnNext          = document.getElementById('btn-next');
 const btnEscape        = document.getElementById('btn-escape');
 const escapePopup      = document.getElementById('escape-popup');
+const kbdModePopup     = document.getElementById('kbdmode-popup');
 
 // offline overlay elements
 const offlineOverlay       = document.getElementById('offline-overlay');
@@ -275,6 +276,11 @@ function _keybarKey(paneId) { return `keybar:${location.hostname}:${paneId}`; }
 function _getKeybar(paneId) { return localStorage.getItem(_keybarKey(paneId)) === 'true'; }
 function _saveKeybar(paneId, on) { localStorage.setItem(_keybarKey(paneId), on); }
 
+// ── line wrap per pane (persisted like kbdMode, restored on switch) ────────
+function _wrapKey(paneId) { return `wrap:${location.hostname}:${paneId}`; }
+function _getWrap(paneId) { return localStorage.getItem(_wrapKey(paneId)) === 'true'; }
+function _saveWrap(paneId, on) { localStorage.setItem(_wrapKey(paneId), on); }
+
 // ── status ─────────────────────────────────────────────────────────────────
 function setStatus(msg, cls) {
   connIndicator.title = msg;
@@ -296,7 +302,7 @@ function connect() {
     _connectedAt = Date.now();
     startClock();
     send({ type: 'list_sessions' });
-    if (currentPane) send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true });
+    if (currentPane) send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
   };
   ws.onclose = (evt) => {
     stopClock();
@@ -323,6 +329,16 @@ function connect() {
       if (msg.new_session) forcedSessionId = msg.new_session;
       if (msg.new_pane) forcedPaneId = msg.new_pane;
       rebuildPaneTree();
+      // An open picker must track topology: without this, rows for a window
+      // that just died stay tappable and navigate to a dead pane, and
+      // _ctxResolveLevel's fallback never runs until the next interaction.
+      // Refocus only when a picker row had focus: focus() can scroll the
+      // list, which would yank a touch user's position on unrelated updates.
+      if (ctxPickerActive()) {
+        const ae = document.activeElement;
+        if (ae && ae.closest('#ctx-list')) _ctxRerender(ae.dataset.ctxId);
+        else renderCtxList();
+      }
     } else if (msg.type === 'snapshot') {
       if (msg.pane_id === currentPane) {
         const forceTop = _scrollTopOnNextSnapshot;
@@ -384,26 +400,12 @@ function paneDisplayName(p) {
   return getPaneName(p.id, '') || title || p.command || 'shell';
 }
 
-function contextPath() {
-  const s = currentSession();
-  const w = currentWindow();
-  const p = currentPaneObj();
-  if (!s || !w || !p) return '';
-  return `${s.name} / ${w.index}:${w.name} / ${paneDisplayName(p)}`;
-}
-
 // ── position label ────────────────────────────────────────────────────────
 function activePaneXYZ() {
-  const s = currentSession();
-  const w = currentWindow();
-  if (!s || !w || !currentPane) return '-/-';
-  const windows = (s.windows || []).filter(win => firstLivePaneInWindow(win));
-  const wIdx = windows.findIndex(win => win.id === currentWindowId);
-  const panes = livePanesInWindow(w);
-  const pIdx = panes.findIndex(p => p.id === currentPane);
-  const wText = wIdx < 0 ? 'W-/-' : `W${wIdx + 1}/${windows.length}`;
-  const pText = pIdx < 0 ? 'P-/-' : `P${pIdx + 1}/${panes.length}`;
-  return `${wText} ${pText}`;
+  const list = flatPaneList();
+  if (!currentPane || list.length === 0) return '-/-';
+  const idx = list.findIndex(e => e.paneId === currentPane);
+  return idx < 0 ? '-/-' : `${idx + 1}/${list.length}`;
 }
 
 function updateXYZLabel() {
@@ -475,16 +477,23 @@ function navigateTo(sessionId, windowId, paneId) {
   if (currentPane) {
     _saveKbdMode(currentPane, kbdMode);
     _saveKeybar(currentPane, keybarVisible());
+    _saveWrap(currentPane, wrapOn);
   }
+  // Scroll mode is a per-view state: switching panes while in it would leave
+  // the new pane top-anchored under a stale SCROLL chip, since the bottom
+  // re-anchor stays suppressed.
+  if (_scrollMode) exitScrollMode();
 
   currentSessionId = sessionId;
   currentWindowId  = windowId;
   currentPane      = paneId;
   _saveLastPane(paneId);
 
-  // Restore keyboard mode and key-bar visibility for the arriving pane.
-  // setKeybarVisible applies the keyboard mode itself.
+  // Restore keyboard mode, wrap state and key-bar visibility for the
+  // arriving pane. setKeybarVisible applies the keyboard mode itself.
   kbdMode = _getKbdMode(paneId);
+  wrapOn  = _getWrap(paneId);
+  applyWrap();
   setKeybarVisible(_getKeybar(paneId));
   cmdInput.disabled = false;
   pwdInput.disabled = false;
@@ -499,29 +508,84 @@ function navigateTo(sessionId, windowId, paneId) {
     output.textContent = 'loading…';
   }
 
-  send({ type: 'subscribe', pane_id: paneId, lines: 300, ansi: true });
+  send({ type: 'subscribe', pane_id: paneId, lines: 300, ansi: true, join: wrapOn });
   updateXYZLabel();
   updateContextName();
 }
 
 // ── context name ──────────────────────────────────────────────────────────
+// The breadcrumb is three tap targets, one per picker level: the session
+// segment opens the sessions list, the window segment the current session's
+// windows, the pane segment the current window's panes. A tap that misses
+// every segment falls through to the container listener, which keeps the
+// windows-level default.
+function _ctxSeg(text, cls, level) {
+  const el = document.createElement('span');
+  el.className = 'ctx-seg ' + cls;
+  el.textContent = text;
+  // No stopPropagation: the document-level closers for the info and escape
+  // popups must keep seeing the click; the container listener skips segment
+  // targets itself.
+  el.addEventListener('click', () => showCtxOverlayAt(level));
+  return el;
+}
+
+function _ctxSegSep() {
+  const el = document.createElement('span');
+  el.className = 'ctx-seg-sep';
+  el.textContent = '/';
+  return el;
+}
+
 function updateContextName() {
-  if (!currentPane) { ctxName.textContent = ''; return; }
-  ctxName.textContent = contextPath() || getPaneName(currentPane, '') || 'shell';
+  ctxName.textContent = '';
+  if (!currentPane) return;
+  const s = currentSession();
+  const w = currentWindow();
+  const p = currentPaneObj();
+  if (!s || !w || !p) {
+    ctxName.textContent = getPaneName(currentPane, '') || 'shell';
+    return;
+  }
+  ctxName.append(
+    _ctxSeg(s.name, 'ctx-seg-session', 'sessions'),
+    _ctxSegSep(),
+    _ctxSeg(`${w.index}:${w.name}`, 'ctx-seg-window', 'windows'),
+    _ctxSegSep(),
+    _ctxSeg(paneDisplayName(p), 'ctx-seg-pane', 'panes'),
+  );
 }
 
 // ── output rendering ───────────────────────────────────────────────────────
 function scrollOutputToBottom() {
+  // Scroll mode owns the viewport: a one-line j/k step stays inside the 60px
+  // bottom-snap zone, so re-anchoring here would yank a live pane back down.
+  if (_scrollMode) return;
   requestAnimationFrame(() => { output.scrollTop = output.scrollHeight; });
 }
+
+// 16-color ANSI palettes, one per theme. Dark is the Tango set the app has
+// always used. Light keeps each hue recognizable but darkens the entries that
+// vanish on a light background (bright yellow, green, cyan, and both whites);
+// every value holds >= 4.5:1 contrast on the light --term-bg (#fafafa).
+// The same array serves SGR background colors (40-47/100-107), so darkened
+// entries make colored backgrounds darker than canonical light schemes;
+// acceptable for rare colored-background output, revisit if it bites.
+const C16_DARK = [
+  '#1e1e1e','#cc0000','#4e9a06','#c4a000','#3465a4','#75507b','#06989a','#d3d7cf',
+  '#555753','#ef2929','#8ae234','#fce94f','#729fcf','#ad7fa8','#34e2e2','#eeeeec',
+];
+const C16_LIGHT = [
+  '#000000','#cc0000','#2d7004','#8a5c00','#3465a4','#75507b','#067a7c','#5d6157',
+  '#555753','#c81e1e','#1c7d1c','#7a6000','#2a65b0','#8f5a8a','#0c7878','#303030',
+];
 
 // Convert ANSI SGR escape codes to HTML spans.
 // Handles: 16/256/truecolor fg+bg, bold, italic, underline. Other sequences discarded.
 function ansiToHtml(text) {
-  const C16 = [
-    '#1e1e1e','#cc0000','#4e9a06','#c4a000','#3465a4','#75507b','#06989a','#d3d7cf',
-    '#555753','#ef2929','#8ae234','#fce94f','#729fcf','#ad7fa8','#34e2e2','#eeeeec',
-  ];
+  // Palette follows the active theme; renders are theme-baked, so a theme
+  // switch clears _paneCache and resubscribes (see rerenderTerminal).
+  const C16 = document.documentElement.dataset.theme === 'light' ? C16_LIGHT : C16_DARK;
   function c256(n) {
     if (n < 16) return C16[n];
     if (n < 232) {
@@ -611,7 +675,7 @@ function sendKeys() {
 }
 
 // ── events ─────────────────────────────────────────────────────────────────
-xyzLabel.addEventListener('click', () => navigateRelativePane(1));
+xyzLabel.addEventListener('click', () => send({ type: 'list_sessions' }));
 cmdInput.addEventListener('keydown', e => {
   // The Enter that commits an IME composition arrives here with
   // isComposing=true (or as Android keyCode 229); it must not reach the pane.
@@ -640,11 +704,21 @@ pwdInput.addEventListener('keydown', e => {
 });
 btnSend.addEventListener('click', sendKeys);
 
-// ── keyboard mode toggle ($_ / Aa / **) ───────────────────────────────────
+// ── keyboard mode popup ($_ / Aa / **) ─────────────────────────────────────
 // 0 = terminal ($_)   no spell-check, no autocorrect
 // 1 = text     (Aa)   spell-check + autocorrect on
 // 2 = password (**)   type="password" input — keyboard does not learn text
+// Tapping the button opens a 3-way popup (like the ⎋ button) rather than
+// cycling on tap: with three real choices a popup is faster to land on the
+// one you want and shows what the other two are, instead of tap-tap-tap
+// past states you don't want to confirm each is the right one.
 let kbdMode = 0;
+const kbdModePopupButtons = {
+  0: document.getElementById('kbdmode-popup-terminal'),
+  1: document.getElementById('kbdmode-popup-text'),
+  2: document.getElementById('kbdmode-popup-password'),
+};
+
 function applyKbdMode() {
   const inPwd = kbdMode === 2;
   cmdInput.style.display = inPwd ? 'none' : '';
@@ -659,9 +733,8 @@ function applyKbdMode() {
     cmdInput.setAttribute('spellcheck', direct ? 'false' : 'true');
     cmdInput.setAttribute('autocorrect', direct ? 'off' : 'on');
     cmdInput.setAttribute('autocapitalize', direct ? 'none' : 'sentences');
-    output.style.whiteSpace = 'pre-wrap';
     btnKbdMode.textContent = 'Aa';
-    btnKbdMode.title = 'Text mode — tap for terminal mode';
+    btnKbdMode.title = 'Text mode — tap to change';
     btnKbdMode.style.color = 'var(--accent)';
     // Don't advertise spell check while direct mode has it forced off.
     if (direct) {
@@ -672,30 +745,64 @@ function applyKbdMode() {
     cmdInput.setAttribute('spellcheck', 'false');
     cmdInput.setAttribute('autocorrect', 'off');
     cmdInput.setAttribute('autocapitalize', 'none');
-    output.style.whiteSpace = 'pre';
     btnKbdMode.textContent = '$_';
-    btnKbdMode.title = 'Terminal mode — tap to enable spell check';
+    btnKbdMode.title = 'Terminal mode — tap to change';
     btnKbdMode.style.color = '';
   } else {
-    output.style.whiteSpace = 'pre';
     btnKbdMode.textContent = '**';
-    btnKbdMode.title = 'Password mode — keyboard will not learn this text';
+    btnKbdMode.title = 'Password mode — tap to change';
     btnKbdMode.style.color = 'var(--accent)';
+  }
+  for (const [mode, btn] of Object.entries(kbdModePopupButtons)) {
+    btn.classList.toggle('current', Number(mode) === kbdMode);
   }
   scrollOutputToBottom();
 }
-btnKbdMode.addEventListener('click', () => {
-  kbdMode = (kbdMode + 1) % 3;
+
+function setKbdMode(mode) {
+  kbdMode = mode;
   if (currentPane) _saveKbdMode(currentPane, kbdMode);
+  // Aa defaults to wrapped text, Terminal/Password to unwrapped -- applied
+  // once here, on the mode switch itself, not forced on every render. A
+  // manual Wrap toggle afterward (escape popup) still sticks until the
+  // keyboard mode is changed again.
+  wrapOn = (kbdMode === 1);
+  if (currentPane) {
+    _saveWrap(currentPane, wrapOn);
+    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+  }
+  applyWrap();
   applyKbdMode();
   // blur + refocus so Android keyboard re-evaluates input type/spellcheck
   const inp = activeInput();
   inp.blur();
   setTimeout(() => inp.focus(), 50);
+}
+
+function showKbdModePopup() {
+  hideEscapePopup();
+  const rect = btnKbdMode.getBoundingClientRect();
+  kbdModePopup.style.display = 'flex';
+  kbdModePopup.style.right   = (window.innerWidth - rect.right) + 'px';
+  kbdModePopup.style.bottom  = (window.innerHeight - rect.top + 8) + 'px';
+}
+
+function hideKbdModePopup() {
+  kbdModePopup.style.display = 'none';
+}
+
+btnKbdMode.addEventListener('click', e => {
+  e.stopPropagation();
+  kbdModePopup.style.display === 'none' ? showKbdModePopup() : hideKbdModePopup();
 });
+
+kbdModePopupButtons[0].addEventListener('click', () => { setKbdMode(0); hideKbdModePopup(); });
+kbdModePopupButtons[1].addEventListener('click', () => { setKbdMode(1); hideKbdModePopup(); });
+kbdModePopupButtons[2].addEventListener('click', () => { setKbdMode(2); hideKbdModePopup(); });
 
 // ── escape / ctrl-c popup ─────────────────────────────────────────────────
 function showEscapePopup() {
+  hideKbdModePopup();
   const rect = btnEscape.getBoundingClientRect();
   escapePopup.style.display = 'flex';
   escapePopup.style.right   = (window.innerWidth - rect.right) + 'px';
@@ -726,9 +833,41 @@ document.getElementById('escape-popup-keys').addEventListener('click', () => {
   hideEscapePopup();
 });
 
-document.addEventListener('click', () => hideEscapePopup());
+// ── line wrap toggle ───────────────────────────────────────────────────────
+// Off (default): tmux's own line breaks, pre with horizontal scroll. On: the
+// daemon captures with -J so soft-wrapped lines come back joined, and
+// pre-wrap reflows them at the phone width. Its own independent, per-pane-
+// persisted state -- not driven by kbdMode -- but choosing a keyboard mode
+// sets a sensible default on the switch (Aa on, Terminal/Password off) so
+// picking Aa wraps immediately without a separate manual step; a Wrap
+// toggle after that still sticks until the keyboard mode is changed again.
+let wrapOn = false;
+const escapePopupWrap = document.getElementById('escape-popup-wrap');
+
+function applyWrap() {
+  output.style.whiteSpace = wrapOn ? 'pre-wrap' : 'pre';
+  // Checkmark prefix like the context picker: on-state must not rely on
+  // color alone.
+  escapePopupWrap.textContent = (wrapOn ? '✓ ' : '⤶ ') + 'Wrap';
+  escapePopupWrap.style.color = wrapOn ? 'var(--accent)' : '';
+}
+
+escapePopupWrap.addEventListener('click', () => {
+  wrapOn = !wrapOn;
+  if (currentPane) {
+    _saveWrap(currentPane, wrapOn);
+    // Resubscribe so the snapshot is re-captured with the new join flag.
+    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+  }
+  applyWrap();
+  scrollOutputToBottom();
+  hideEscapePopup();
+});
+
+document.addEventListener('click', () => { hideEscapePopup(); hideKbdModePopup(); });
 document.addEventListener('touchstart', e => {
   if (!escapePopup.contains(e.target) && e.target !== btnEscape) hideEscapePopup();
+  if (!kbdModePopup.contains(e.target) && e.target !== btnKbdMode) hideKbdModePopup();
 }, { passive: true });
 
 // ── key bar (Esc, Ctrl, Tab, arrows; direct key mode for TUIs like vi) ─────
@@ -891,6 +1030,19 @@ function navigateRelativePane(delta) {
   navigateTo(currentSessionId, w.id, nextPane.id);
 }
 
+// Next/previous window within the current session, wrapping; lands on the
+// window's first live pane. Used by the hardware prefix+n / prefix+p bindings.
+function navigateRelativeWindow(delta) {
+  const s = currentSession();
+  if (!s) return;
+  const windows = (s.windows || []).filter(w => firstLivePaneInWindow(w));
+  if (windows.length < 2) return;
+  const idx = windows.findIndex(w => w.id === currentWindowId);
+  const next = windows[((idx < 0 ? 0 : idx) + delta + windows.length) % windows.length];
+  const p = firstLivePaneInWindow(next);
+  if (p) navigateTo(s.id, next.id, p.id);
+}
+
 // ── touch swipe tracking (used for swipe nav) ─────────────────────────────
 let _touchX = 0, _touchY = 0;
 
@@ -904,61 +1056,124 @@ btnNext.addEventListener('click', () => navigateRelative(1));
 document.getElementById('btn-create').addEventListener('click', showCreateOverlay);
 
 // ── context jump list (tap context name in header) ─────────────────────────
-// Hierarchical picker: sessions first, then windows inside each session, then
-// panes inside each window. This keeps tmux's session/window/pane model visible
-// instead of reducing everything to a long pane list.
+// Drill-down picker: one list per level (sessions, windows, panes) instead of
+// one flat indented tree, which turned into a giant scroll with many contexts.
+// _ctxLevel/_ctxSessionId/_ctxWindowId hold where the picker is;
+// showCtxOverlayAt resets them to the requested level on every open.
+let _ctxLevel     = 'windows'; // 'sessions' | 'windows' | 'panes'
+let _ctxSessionId = null;
+let _ctxWindowId  = null;
+
+function liveWindowsInSession(s) {
+  return (s?.windows || []).filter(w => firstLivePaneInWindow(w));
+}
+
+function _ctxSessionObj() {
+  return sessions.find(s => s.id === _ctxSessionId) || null;
+}
+
+function _ctxWindowObj() {
+  return (_ctxSessionObj()?.windows || []).find(w => w.id === _ctxWindowId) || null;
+}
+
+// A snapshot update can leave the picker pointing at a session or
+// window that no longer has live panes; fall back to the level above.
+function _ctxResolveLevel() {
+  if (_ctxLevel === 'panes' && !livePanesInWindow(_ctxWindowObj()).length) _ctxLevel = 'windows';
+  if (_ctxLevel === 'windows' && !liveWindowsInSession(_ctxSessionObj()).length) _ctxLevel = 'sessions';
+}
+
+function _ctxAddRow(label, isCurrent, onClick) {
+  const btn = document.createElement('button');
+  btn.className = 'ctx-btn' + (isCurrent ? ' ctx-current' : '');
+  btn.textContent = (isCurrent ? '✓ ' : '') + label;
+  btn.addEventListener('click', onClick);
+  ctxList.appendChild(btn);
+  return btn;
+}
+
+function _ctxAddTitle(text) {
+  const el = document.createElement('div');
+  el.className = 'ctx-title';
+  el.textContent = text;
+  ctxList.appendChild(el);
+}
+
+function _ctxAddBackRow(label, onClick) {
+  const btn = _ctxAddRow('← ' + label, false, onClick);
+  btn.classList.add('ctx-dim');
+  const sep = document.createElement('div');
+  sep.className = 'ctx-sep';
+  ctxList.appendChild(sep);
+}
+
+// Re-render after a level change and move real DOM focus so prefix+w j/k
+// keeps working: prefer the row we came from, then the current-context row.
+function _ctxRerender(focusId) {
+  renderCtxList();
+  const rows = pickerRows();
+  const target = (focusId && rows.find(b => b.dataset.ctxId === focusId))
+    || rows.filter(b => b.classList.contains('ctx-current')).pop()
+    // In a non-current session or window nothing is ctx-current; prefer the
+    // first real entry over the back row so Enter keeps drilling down.
+    || rows.find(b => b.dataset.ctxId)
+    || rows[0];
+  if (target) target.focus();
+}
+
 function renderCtxList() {
   ctxList.innerHTML = '';
-  for (const s of sessions) {
-    const sessionHasLivePane = (s.windows || []).some(w => firstLivePaneInWindow(w));
-    if (!sessionHasLivePane) continue;
+  _ctxResolveLevel();
 
-    if (ctxList.children.length) {
-      const sep = document.createElement('div');
-      sep.className = 'ctx-sep';
-      ctxList.appendChild(sep);
-    }
-
-    const sBtn = document.createElement('button');
-    sBtn.className = 'ctx-btn' + (s.id === currentSessionId ? ' ctx-current' : '');
-    sBtn.textContent = (s.id === currentSessionId ? '✓ ' : '') + s.name;
-    sBtn.addEventListener('click', () => {
-      const firstWindow = (s.windows || []).find(w => firstLivePaneInWindow(w));
-      const firstPane = firstLivePaneInWindow(firstWindow);
-      hideCtxOverlay();
-      if (firstWindow && firstPane) navigateTo(s.id, firstWindow.id, firstPane.id);
-    });
-    ctxList.appendChild(sBtn);
-
-    for (const w of (s.windows || [])) {
-      const livePanes = livePanesInWindow(w);
-      if (!livePanes.length) continue;
-      const isCurrentWindow = s.id === currentSessionId && w.id === currentWindowId;
-      const wBtn = document.createElement('button');
-      wBtn.className = 'ctx-btn ctx-window-btn' + (isCurrentWindow ? ' ctx-current' : '');
-      wBtn.textContent = `${isCurrentWindow ? '✓ ' : ''}${w.index}:${w.name}`;
-      wBtn.addEventListener('click', () => {
-        const p = firstLivePaneInWindow(w);
-        hideCtxOverlay();
-        if (p) navigateTo(s.id, w.id, p.id);
+  if (_ctxLevel === 'sessions') {
+    _ctxAddTitle('Sessions');
+    for (const s of sessions) {
+      if (!liveWindowsInSession(s).length) continue;
+      const btn = _ctxAddRow(s.name, s.id === currentSessionId, () => {
+        _ctxSessionId = s.id;
+        _ctxLevel = 'windows';
+        _ctxRerender(null);
       });
-      ctxList.appendChild(wBtn);
-
-      for (const p of livePanes) {
-        const isCurrent = p.id === currentPane;
-        const btn = document.createElement('button');
-        btn.className = 'ctx-btn ctx-pane-btn' + (isCurrent ? ' ctx-current' : '');
-        const name = paneDisplayName(p);
-        btn.textContent = (isCurrent ? '✓ ' : '') + name;
-        btn.addEventListener('click', () => {
-          hideCtxOverlay();
-          if (!isCurrent) navigateTo(s.id, w.id, p.id);
-        });
-        ctxList.appendChild(btn);
-      }
+      btn.dataset.ctxId = s.id;
+      btn.dataset.descend = '1';
+    }
+  } else if (_ctxLevel === 'windows') {
+    const s = _ctxSessionObj();
+    _ctxAddBackRow('Sessions', () => {
+      _ctxLevel = 'sessions';
+      _ctxRerender(s.id);
+    });
+    _ctxAddTitle(s.name);
+    for (const w of liveWindowsInSession(s)) {
+      const isCurrent = s.id === currentSessionId && w.id === currentWindowId;
+      const btn = _ctxAddRow(`${w.index}:${w.name}`, isCurrent, () => {
+        _ctxWindowId = w.id;
+        _ctxLevel = 'panes';
+        _ctxRerender(null);
+      });
+      btn.dataset.ctxId = w.id;
+      btn.dataset.descend = '1';
+    }
+  } else {
+    const s = _ctxSessionObj();
+    const w = _ctxWindowObj();
+    _ctxAddBackRow(s.name, () => {
+      _ctxLevel = 'windows';
+      _ctxRerender(w.id);
+    });
+    _ctxAddTitle(`${w.index}:${w.name}`);
+    for (const p of livePanesInWindow(w)) {
+      const isCurrent = p.id === currentPane;
+      const btn = _ctxAddRow(paneDisplayName(p), isCurrent, () => {
+        hideCtxOverlay();
+        if (!isCurrent) navigateTo(s.id, w.id, p.id);
+      });
+      btn.dataset.ctxId = p.id;
     }
   }
-  if (!ctxList.children.length) {
+
+  if (!pickerRows().length) {
+    ctxList.innerHTML = '';
     const empty = document.createElement('div');
     empty.className = 'ctx-dim';
     empty.style.padding = '16px';
@@ -967,16 +1182,35 @@ function renderCtxList() {
   }
 }
 
-function showCtxOverlay() {
+// Open at an explicit level: 'sessions' lists all sessions, 'windows' the
+// current session's windows, 'panes' the current window's panes. No
+// persistence across opens.
+function showCtxOverlayAt(level) {
+  // Like navigateTo: the keydown dispatch checks scroll mode before the
+  // picker, so an open picker under scroll mode would have a dead keyboard.
+  if (_scrollMode) exitScrollMode();
+  _ctxLevel     = level;
+  _ctxSessionId = currentSessionId;
+  _ctxWindowId  = level === 'panes' ? currentWindowId : null;
   renderCtxList();
   ctxListView.style.display = '';
   ctxRenameForm.style.display = 'none';
   ctxOverlay.style.display = 'flex';
 }
+
+function showCtxOverlay() {
+  // Windows is the middle ground: sessions are one Back away and the current
+  // window's panes one tap away.
+  showCtxOverlayAt('windows');
+}
 function hideCtxOverlay() {
   ctxOverlay.style.display = 'none';
 }
-ctxName.addEventListener('click', showCtxOverlay);
+ctxName.addEventListener('click', e => {
+  // Segment clicks open their own level; only a miss keeps the default.
+  if (e.target.closest('.ctx-seg')) return;
+  showCtxOverlay();
+});
 ctxCancel.addEventListener('click', hideCtxOverlay);
 ctxOverlay.addEventListener('click', e => { if (e.target === ctxOverlay) hideCtxOverlay(); });
 
@@ -1009,8 +1243,9 @@ function showRenameForm() {
 }
 function backToCtxList() {
   ctxRenameForm.style.display = 'none';
-  renderCtxList();
+  // List visible before _ctxRerender: focus() on a hidden element is a no-op.
   ctxListView.style.display = '';
+  _ctxRerender(null);
 }
 ctxRenameOpen.addEventListener('click', showRenameForm);
 ctxRenameBack.addEventListener('click', backToCtxList);
@@ -1378,6 +1613,192 @@ async function applyHostname() {
   } catch { /* ignore */ }
 }
 
+// ── display settings (font family, terminal font size, theme) ─────────────
+// Device-global (plain localStorage keys, not per pane). The theme itself is
+// two CSS palettes on html[data-theme]; the inline head script applies the
+// saved choice before first paint, this section handles live changes. The
+// terminal output follows the theme too (see --term-* in the CSS), and
+// ansiToHtml swaps between C16_DARK and C16_LIGHT to match.
+// Local fonts only, no downloads: every entry is listed, and ones the device
+// cannot render are annotated "(not installed)" but stay selectable (see
+// fontResolves and renderSettings; hiding them made selection a one-way
+// door). The list mixes desktop staples with the monospace families Android
+// ships (Droid Sans Mono, Cutive Mono, and OEM extras).
+const FONT_FAMILIES = [
+  { label: 'System',         value: "'SF Mono', 'Fira Code', 'Cascadia Code', monospace" },
+  { label: 'Fira Code',      value: "'Fira Code', monospace",      probe: 'Fira Code' },
+  { label: 'JetBrains Mono', value: "'JetBrains Mono', monospace", probe: 'JetBrains Mono' },
+  { label: 'Cascadia Code',  value: "'Cascadia Code', monospace",  probe: 'Cascadia Code' },
+  { label: 'Droid Sans Mono', value: "'Droid Sans Mono', monospace", probe: 'Droid Sans Mono' },
+  { label: 'Roboto Mono',    value: "'Roboto Mono', monospace",    probe: 'Roboto Mono' },
+  { label: 'Noto Sans Mono', value: "'Noto Sans Mono', monospace", probe: 'Noto Sans Mono' },
+  { label: 'Cutive Mono',    value: "'Cutive Mono', monospace",    probe: 'Cutive Mono' },
+  { label: 'Courier',        value: "'Courier New', Courier, monospace", probe: 'Courier New' },
+];
+
+// True when the bare family renders, measured against proportional generics.
+// Width measurement rather than document.fonts.check: Chrome on Android
+// resolves 'Courier New' through a font alias that fonts.check misses. The
+// comparison is against serif and sans-serif, NOT monospace: most monospace
+// fonts share the 0.6em advance, so a present family can be width-identical
+// to the monospace default while looking entirely different. A missing
+// family falls back to the generic and measures equal, so this fails closed.
+const _fontProbe = document.createElement('canvas').getContext('2d');
+function fontResolves(family) {
+  const sample = 'mmmmmmmmmmillWW##1234567890';
+  const width = font => {
+    _fontProbe.font = `16px ${font}`;
+    return _fontProbe.measureText(sample).width;
+  };
+  return width(`"${family}", serif`) !== width('serif')
+      && width(`"${family}", sans-serif`) !== width('sans-serif');
+}
+
+// Installed fonts cannot change mid-session; probe once at load.
+const _resolvedFonts = new Set(
+  FONT_FAMILIES.filter(f => !f.probe || fontResolves(f.probe)).map(f => f.label));
+const THEME_CHOICES = [
+  ['dark',  'Dark'],
+  ['light', 'Light'],
+  ['auto',  'Device (auto)'],
+];
+const FONT_SIZE_MIN = 10, FONT_SIZE_MAX = 16, FONT_SIZE_DEFAULT = 12;
+
+let fontFamily = localStorage.getItem('font-family') || 'System';
+if (!FONT_FAMILIES.some(f => f.label === fontFamily)) fontFamily = 'System';
+let fontSize   = parseInt(localStorage.getItem('font-size'), 10);
+if (!(fontSize >= FONT_SIZE_MIN && fontSize <= FONT_SIZE_MAX)) fontSize = FONT_SIZE_DEFAULT;
+let themePref  = localStorage.getItem('theme') || 'dark';
+if (!THEME_CHOICES.some(([v]) => v === themePref)) themePref = 'dark';
+
+const settingsOverlay   = document.getElementById('settings-overlay');
+const settingsThemeList = document.getElementById('settings-theme-list');
+const settingsFontList  = document.getElementById('settings-font-list');
+const settingsSizeValue = document.getElementById('settings-size-value');
+const themeColorMeta    = document.querySelector('meta[name="theme-color"]');
+const _lightSchemeMq    = matchMedia('(prefers-color-scheme: light)');
+// Captured before the first applyFont() so it is the CSS default stack, not
+// a saved override; used to preview the System row from the CSS source.
+const _cssDefaultFont   =
+  getComputedStyle(document.documentElement).getPropertyValue('--font');
+
+function applyFont() {
+  const f = FONT_FAMILIES.find(f => f.label === fontFamily) || FONT_FAMILIES[0];
+  // 'System' leaves --font alone so the CSS default stays the single source
+  // of truth for the default stack.
+  if (f === FONT_FAMILIES[0]) {
+    document.documentElement.style.removeProperty('--font');
+  } else {
+    document.documentElement.style.setProperty('--font', f.value);
+  }
+  // Size scales the terminal output only; the rest of the UI keeps its
+  // tuned per-element sizes.
+  output.style.fontSize = fontSize + 'px';
+}
+
+function applyTheme() {
+  const next = themePref === 'auto' ? (_lightSchemeMq.matches ? 'light' : 'dark') : themePref;
+  // The head script set the theme before app.js ran, so on startup this is a
+  // no-op and only real flips trigger a terminal re-render.
+  const flipped = document.documentElement.dataset.theme !== next;
+  document.documentElement.dataset.theme = next;
+  // PWA chrome follows the active background.
+  themeColorMeta.content =
+    getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+  if (flipped) rerenderTerminal();
+}
+
+// Rendered output has ansiToHtml palette colors baked into its HTML, so a
+// theme flip invalidates every cached snapshot. Clear the cache and
+// resubscribe the current pane; the next snapshot renders with the new
+// palette.
+function rerenderTerminal() {
+  _paneCache.clear();
+  if (currentPane) {
+    // join must ride every resubscribe: without it the daemon captures this
+    // pane unjoined, and with wrap on the re-render hard-breaks long lines
+    // at the tmux pane width until the next pane switch.
+    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+  }
+}
+
+// Live-update while in auto mode when the device scheme flips.
+_lightSchemeMq.addEventListener('change', () => {
+  if (themePref === 'auto') applyTheme();
+});
+
+function renderSettings() {
+  // Checkmark prefix like the context picker: the selected row must not
+  // rely on color alone.
+  settingsThemeList.innerHTML = '';
+  for (const [value, label] of THEME_CHOICES) {
+    const on = value === themePref;
+    const btn = document.createElement('button');
+    btn.className = 'ctx-btn' + (on ? ' ctx-current' : '');
+    btn.textContent = (on ? '✓ ' : '') + label;
+    btn.addEventListener('click', () => {
+      themePref = value;
+      localStorage.setItem('theme', value);
+      applyTheme();
+      renderSettings();
+    });
+    settingsThemeList.appendChild(btn);
+  }
+  settingsFontList.innerHTML = '';
+  for (const f of FONT_FAMILIES) {
+    const on = f.label === fontFamily;
+    const available = _resolvedFonts.has(f.label);
+    // Entries the probe says are missing are hidden, not just dimmed, so the
+    // list only shows choices that actually do something on this device.
+    // Exception: the currently selected font always stays visible, even if
+    // unresolved -- the probe can false-negative (Chrome on Android may not
+    // expose raw platform family names), and a selected font disappearing
+    // out from under you is worse than an unreachable row in the list.
+    if (!available && !on) continue;
+    const btn = document.createElement('button');
+    btn.className = 'ctx-btn' + (on ? ' ctx-current' : '');
+    btn.textContent = (on ? '✓ ' : '') + f.label + (available ? '' : ' (not installed)');
+    if (!available) btn.style.opacity = '0.55';
+    // Preview each row in its own face; System previews with the CSS default
+    // captured at load so the CSS stays the single source of truth.
+    btn.style.fontFamily = f === FONT_FAMILIES[0] ? _cssDefaultFont : f.value;
+    btn.addEventListener('click', () => {
+      fontFamily = f.label;
+      localStorage.setItem('font-family', f.label);
+      applyFont();
+      renderSettings();
+    });
+    settingsFontList.appendChild(btn);
+  }
+  settingsSizeValue.textContent = fontSize + 'px';
+}
+
+function stepFontSize(delta) {
+  const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, fontSize + delta));
+  if (next === fontSize) return;
+  fontSize = next;
+  localStorage.setItem('font-size', next);
+  applyFont();
+  settingsSizeValue.textContent = next + 'px';
+}
+
+function showSettingsOverlay() {
+  renderSettings();
+  settingsOverlay.style.display = 'flex';
+}
+function hideSettingsOverlay() {
+  settingsOverlay.style.display = 'none';
+}
+
+document.getElementById('btn-settings').addEventListener('click', showSettingsOverlay);
+document.getElementById('settings-close').addEventListener('click', hideSettingsOverlay);
+document.getElementById('settings-size-down').addEventListener('click', () => stepFontSize(-1));
+document.getElementById('settings-size-up').addEventListener('click', () => stepFontSize(1));
+settingsOverlay.addEventListener('click', e => { if (e.target === settingsOverlay) hideSettingsOverlay(); });
+
+applyFont();
+applyTheme();
+
 // ── biometric button wiring ───────────────────────────────────────────────
 
 document.getElementById('bio-enable-btn').addEventListener('click', async () => {
@@ -1420,6 +1841,246 @@ document.getElementById('lock-unlock-btn').addEventListener('click', async () =>
   }
 });
 
+
+// ── hardware-keyboard tmux bindings (Ctrl+B prefix) ────────────────────────
+// Local capture for hardware keyboards: Ctrl+B arms a 2s pending-prefix state
+// (chip in the statusbar, Esc cancels), then w opens the context picker with
+// j/k navigation, n/p cycle windows, [ enters a client-side scroll mode on
+// the snapshot div. byobu's remote prefix stays F12/Ctrl-A and the key bar's
+// sticky Ctrl still sends a literal C-b, so capturing Ctrl+B here strands no
+// one. Everything is inert until a hardware Ctrl+B actually arrives, so
+// touch-only users see zero UI change. In scroll mode, unhandled keys
+// (printable or not) are swallowed and ignored so nothing leaks into the
+// inputs; q or Esc exits.
+const kbdModeChip = document.getElementById('kbd-mode-chip');
+const PREFIX_TIMEOUT_MS = 2000;
+let _prefixArmed = false;
+let _prefixTimer = null;
+let _scrollMode  = false;
+
+function _showKbdChip(text) {
+  kbdModeChip.textContent = text;
+  kbdModeChip.style.display = '';
+}
+function _hideKbdChip() { kbdModeChip.style.display = 'none'; }
+
+// The one definition of the prefix chord, used by every mode: unshifted
+// plain Ctrl+B (Ctrl+Shift+B is the browser's bookmarks-bar toggle). Four
+// call sites once drifted apart; keep them on this predicate.
+function isPrefixChord(e) {
+  return e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey
+      && e.key.toLowerCase() === 'b';
+}
+
+function armPrefix() {
+  _prefixArmed = true;
+  clearTimeout(_prefixTimer);
+  _prefixTimer = setTimeout(disarmPrefix, PREFIX_TIMEOUT_MS);
+  _showKbdChip('C-b');
+}
+function disarmPrefix() {
+  _prefixArmed = false;
+  clearTimeout(_prefixTimer);
+  _prefixTimer = null;
+  _hideKbdChip();
+}
+
+// ── scroll mode (prefix+[) ── pure scrollTop manipulation of #output
+function enterScrollMode() {
+  _scrollMode = true;
+  // Move focus off the inputs so nothing types into them while scrolling.
+  const ae = document.activeElement;
+  if (ae && typeof ae.blur === 'function') ae.blur();
+  _showKbdChip('SCROLL');
+}
+function exitScrollMode() {
+  _scrollMode = false;
+  _hideKbdChip();
+  // Entry blurred the input, so q/Esc would strand focus on body and the
+  // next keystrokes would go nowhere. Scroll mode is only reachable via a
+  // hardware Ctrl+B, so refocusing cannot pop a soft keyboard.
+  activeInput().focus();
+}
+
+function handleScrollKey(e) {
+  // Bare modifier keydowns pass; the chord they start is judged on its own.
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+  const line = parseFloat(getComputedStyle(output).lineHeight) || 18;
+  const page = Math.max(line, output.clientHeight - line);
+  const half = Math.max(line, Math.round(output.clientHeight / 2));
+  let step = null;
+  if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+    const k = e.key;
+    if (k === 'q' || k === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      exitScrollMode();
+      return;
+    }
+    if      (k === 'j' || k === 'ArrowDown') step = line;
+    else if (k === 'k' || k === 'ArrowUp')   step = -line;
+    else if (k === 'PageDown')               step = page;
+    else if (k === 'PageUp')                 step = -page;
+  } else if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+    const k = e.key.toLowerCase();
+    if      (k === 'd') step = half;
+    else if (k === 'u') step = -half;
+    else if (isPrefixChord(e)) {
+      // Never let Ctrl+B reach the browser (Firefox opens the bookmarks
+      // sidebar): leave scroll mode and re-arm the prefix instead.
+      e.preventDefault();
+      e.stopPropagation();
+      exitScrollMode();
+      armPrefix();
+      return;
+    }
+    else return; // other Ctrl chords (reload, tab switch, ...) pass through
+  } else {
+    return; // Alt/Meta chords pass through
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  if (step !== null) output.scrollTop += step;
+}
+
+// ── context picker keyboard navigation (prefix+w, prefix+s) ────────────────
+function ctxPickerActive() {
+  return ctxOverlay.style.display !== 'none' && ctxRenameForm.style.display === 'none';
+}
+
+function pickerRows() {
+  return [...ctxList.querySelectorAll('.ctx-btn')];
+}
+
+function movePickerFocus(delta) {
+  const rows = pickerRows();
+  if (!rows.length) return;
+  const idx = rows.indexOf(document.activeElement);
+  const next = idx < 0
+    ? rows[delta > 0 ? 0 : rows.length - 1]
+    : rows[(idx + delta + rows.length) % rows.length];
+  next.focus();
+  next.scrollIntoView({ block: 'nearest' });
+}
+
+function openCtxPickerKeyboard(level) {
+  showCtxOverlayAt(level || 'windows');
+  // The ctx-current row is the current window at the windows level and the
+  // current session at the sessions level: Enter descends into it. Fall back
+  // to the first row.
+  const rows = pickerRows();
+  const marked = rows.filter(b => b.classList.contains('ctx-current'));
+  const start = marked[marked.length - 1] || rows[0];
+  if (start) start.focus();
+}
+
+// Esc or h at a deeper picker level goes up one; returns false at the top so
+// the caller closes instead.
+function ctxPickerUp() {
+  if (_ctxLevel === 'panes')   { _ctxLevel = 'windows';  _ctxRerender(_ctxWindowId);  return true; }
+  if (_ctxLevel === 'windows') { _ctxLevel = 'sessions'; _ctxRerender(_ctxSessionId); return true; }
+  return false;
+}
+
+function handlePickerKey(e) {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!ctxPickerUp()) hideCtxOverlay();
+    return;
+  }
+  const ae = document.activeElement;
+  const isField = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA');
+  if (isPrefixChord(e)) {
+    // Never let Ctrl+B reach the browser (Firefox opens the bookmarks
+    // sidebar): close the picker and re-arm the prefix, with the same
+    // foreign-field exemption as the neutral-state capture below.
+    if (isField && ae !== cmdInput && ae !== pwdInput) return;
+    e.preventDefault();
+    e.stopPropagation();
+    hideCtxOverlay();
+    armPrefix();
+    return;
+  }
+  // With a text field focused (picker opened by tap while typing), only Esc
+  // acts; j/k keep typing and arrows keep moving the caret.
+  if (isField) return;
+  if (e.key === 'q') {
+    // Close outright from any depth, like scroll mode and tmux choose-tree;
+    // Esc walks up a level first, so q is the one-keystroke close.
+    e.preventDefault();
+    e.stopPropagation();
+    hideCtxOverlay();
+  } else if (e.key === 'j' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    e.stopPropagation();
+    movePickerFocus(1);
+  } else if (e.key === 'k' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    e.stopPropagation();
+    movePickerFocus(-1);
+  } else if (e.key === 'h' || e.key === 'ArrowLeft') {
+    e.preventDefault();
+    e.stopPropagation();
+    ctxPickerUp();
+  } else if (e.key === 'l' || e.key === 'ArrowRight') {
+    // Descend only: pane rows and footer buttons have no descend flag, so l
+    // never navigates or closes by accident.
+    e.preventDefault();
+    e.stopPropagation();
+    if (ae && ae.dataset.descend) ae.click();
+  }
+  // Enter falls through: the focused button's native activation fires its
+  // existing click handler.
+}
+
+// ── prefix key dispatch ─────────────────────────────────────────────────────
+function handlePrefixKey(e) {
+  // Bare modifier keydowns (Ctrl going down for a chord) keep the prefix armed.
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (isPrefixChord(e)) { armPrefix(); return; } // key repeat re-arms
+  disarmPrefix();
+  // Modified keys are unbound: Ctrl+W while armed must not open the picker.
+  const k = (e.ctrlKey || e.altKey || e.metaKey) ? '' : e.key;
+  if      (k === 'w') openCtxPickerKeyboard();
+  else if (k === 's') openCtxPickerKeyboard('sessions'); // tmux choose-session analog
+  else if (k === 'n') navigateRelativeWindow(1);
+  else if (k === 'p') navigateRelativeWindow(-1);
+  else if (k === 'o') navigateRelativePane(1);
+  else if (k === 'O') navigateRelativePane(-1); // no tmux default for backward; mirrors o
+  // tmux binds prefix+arrows to directional pane selection; the PWA shows one
+  // pane at a time, so down/j means next and up/k means previous.
+  else if (k === 'ArrowDown' || k === 'j') navigateRelativePane(1);
+  else if (k === 'ArrowUp'   || k === 'k') navigateRelativePane(-1);
+  else if (k === '[') enterScrollMode();
+  // Esc and any unbound key: prefix cancelled, keystroke swallowed (tmux-like).
+}
+
+// Capture phase so the bindings run ahead of the input handlers; a handled
+// key calls preventDefault, which also stops the direct-mode input event
+// from ever firing (Ctrl+B itself produces no input event at all).
+document.addEventListener('keydown', e => {
+  // Same IME guard as the input handlers above.
+  if (e.isComposing || e.keyCode === 229) return;
+  if (_isLocked) return;
+
+  if (_scrollMode)       { handleScrollKey(e); return; }
+  if (ctxPickerActive()) { handlePickerKey(e); return; }
+  if (_prefixArmed)      { handlePrefixKey(e); return; }
+
+  if (isPrefixChord(e)) {
+    // Arm from anywhere except foreign text fields (pairing code, rename and
+    // create forms); cmdInput and pwdInput are where keyboard users live.
+    const ae = document.activeElement;
+    const isField = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA');
+    if (isField && ae !== cmdInput && ae !== pwdInput) return;
+    e.preventDefault(); // Ctrl+B is bold/bookmark-ish in some browser contexts
+    e.stopPropagation();
+    armPrefix();
+  }
+}, true);
 
 // ── keyboard-aware viewport (visualViewport) ───────────────────────────────
 // iOS/Android don't resize the layout viewport when the on-screen keyboard

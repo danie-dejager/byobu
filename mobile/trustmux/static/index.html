@@ -27,7 +27,42 @@
       --green:    #4ec94e;
       --amber:    #e0a040;
       --red:      #e05050;
-      --font:     'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+      /* No 'Courier New' before the generic: Android aliases it to Cutive
+         Mono (serif-monospace), which silently replaced the platform default
+         (Droid Sans Mono) for every Android user. Courier stays available as
+         an explicit choice in the font settings. */
+      --font:     'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      /* terminal output colors are separate from the UI accents: ansiToHtml
+         picks the 16-color ANSI palette matching the active theme, so the
+         output area follows light/dark along with these variables */
+      --term-bg:   #141414;
+      --term-text: #d4d4d4;
+      --term-dim:  #666;
+    }
+
+    /* ── light theme (html[data-theme="light"], set before first paint by the
+       inline head script; "auto" resolves via prefers-color-scheme) ──
+       All values checked for >= 4.5:1 contrast against every steady
+       background they sit on, including --bg3 (icon and key-bar buttons:
+       accent 5.19:1, green 5.05:1, red 5.14:1); momentary :active states
+       dip below, which is accepted. --dim intentionally darker than the
+       dark theme's (see e894f3db). */
+    html[data-theme="light"] {
+      --bg:       #f2f2f2;
+      --bg2:      #ffffff;
+      --bg3:      #e6e6e6;
+      --border:   #c4c4c4;
+      --text:     #1e1e1e;
+      --dim:      #616161;
+      --accent:   #15619f;
+      --green:    #1a6f1a;
+      --amber:    #8a5c00;
+      --red:      #b02f22;
+      /* terminal output follows the theme; ansiToHtml switches to the
+         light-tuned ANSI palette to match (>= 4.5:1 on this background) */
+      --term-bg:   #fafafa;
+      --term-text: #1e1e1e;
+      --term-dim:  #616161;
     }
 
     html, body {
@@ -63,16 +98,34 @@
       overflow: hidden; white-space: nowrap; flex-shrink: 1; min-width: 0;
     }
     #ctx-name {
-      max-width: 48vw; overflow: hidden;
-      text-overflow: ellipsis; white-space: nowrap;
+      display: flex; align-items: center;
+      max-width: 48vw; white-space: nowrap;
       color: var(--accent); font-size: 11px;
       letter-spacing: 0.03em; padding: 0 4px;
       cursor: pointer; user-select: none; flex-shrink: 0;
     }
-    #ctx-name:active { opacity: 0.7; }
+    /* breadcrumb segments: each ellipsizes on its own; flex-shrink ratios
+       make the pane shrink fastest (all three shrink at once, so this only
+       approximates the old end-of-string truncation). Vertical padding
+       pulled back with a negative margin grows the touch target above the
+       bar without growing it; #ctx-name must not clip (overflow: hidden
+       also clips hit testing). The band below loses to #output's opaque
+       background in hit testing; the band above overlaps the bottom edge of
+       whatever precedes the statusbar and wins there, shaving those targets
+       slightly. min-width floors each segment so a long sibling cannot
+       shrink its tap target away. */
+    .ctx-seg {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      min-width: 1.5em; padding: 10px 2px; margin: -10px 0;
+    }
+    .ctx-seg:active { opacity: 0.7; }
+    .ctx-seg-session { flex-shrink: 1; }
+    .ctx-seg-window  { flex-shrink: 2; }
+    .ctx-seg-pane    { flex-shrink: 4; }
+    .ctx-seg-sep { flex-shrink: 0; padding: 0 3px; opacity: 0.65; }
     #xyz-label {
-      min-width: 86px; text-align: center; flex-shrink: 0;
-      color: var(--text); font-size: 11px; letter-spacing: 0.03em;
+      width: 44px; text-align: center; flex-shrink: 0;
+      color: var(--text); font-size: 13px; letter-spacing: 0.05em;
       cursor: pointer; user-select: none;
     }
     #xyz-label:active { color: var(--accent); }
@@ -116,8 +169,8 @@
     }
     select:disabled { opacity: 0.4; cursor: default; }
 
-    /* ── context menu + create overlay ── */
-    #ctx-overlay, #create-overlay {
+    /* ── context menu + create + settings overlay ── */
+    #ctx-overlay, #create-overlay, #settings-overlay {
       position: fixed; inset: 0; z-index: 200;
       background: rgba(0,0,0,0.72);
       display: flex; align-items: center; justify-content: center;
@@ -142,12 +195,35 @@
                        font-family: var(--font); text-align: center; }
 
     /* ── context jump list (tap context name in header) ── */
-    /* capped + scrollable so a long session/window/pane tree doesn't push the
+    /* capped + scrollable so a long window/pane list doesn't push the
        Rename/Cancel buttons off-screen or grow the box past the viewport */
     #ctx-list { max-height: 58vh; overflow-y: auto; }
-    .ctx-window-btn { padding-left: 28px; }
-    .ctx-pane-btn { padding-left: 40px; font-size: 13px; }
+    /* level title of the drill-down picker: which session/window is open */
+    .ctx-title {
+      padding: 10px 16px 2px; color: var(--text); font-size: 11px;
+      letter-spacing: 0.08em; text-transform: uppercase; font-family: var(--font);
+    }
     .ctx-btn.ctx-current { color: var(--accent); }
+    /* keyboard highlight for prefix+w navigation: real DOM focus moved from a
+       keydown handler matches :focus-visible, so touch taps stay outline-free */
+    .ctx-btn:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: -2px;
+      background: var(--bg3);
+    }
+
+    /* ── display settings popup (gear in header) ── */
+    /* three sections stack tall on small phones, so the box scrolls */
+    #settings-overlay #ctx-box { max-height: 82vh; overflow-y: auto; }
+    .settings-heading {
+      padding: 10px 16px 2px; color: var(--text); font-size: 11px;
+      letter-spacing: 0.08em; text-transform: uppercase; font-family: var(--font);
+    }
+    #settings-size-row {
+      display: flex; align-items: center; justify-content: center;
+      gap: 14px; padding: 8px 16px;
+    }
+    #settings-size-row .icon-btn { min-width: 44px; font-size: 16px; }
+    #settings-size-value { font-size: 15px; min-width: 52px; text-align: center; }
 
     .icon-btn {
       background: var(--bg3); color: var(--text);
@@ -231,17 +307,27 @@
     }
     #btn-create { margin-left: auto; }
 
+    /* ── hardware-keyboard mode chip (prefix armed / scroll mode) ──
+       hidden until a hardware Ctrl+B arrives, so touch-only users never see it */
+    #kbd-mode-chip {
+      display: inline-block; padding: 1px 7px; border-radius: 8px;
+      /* var(--bg), not #fff: white on the dark accent is 2.91:1; the page
+         background clears 7:1 on the accent in both themes */
+      background: var(--accent); color: var(--bg);
+      font-size: 10px; letter-spacing: 0.05em; flex-shrink: 0;
+    }
+
     /* ── output area ── */
     #output {
       flex: 1; overflow-y: auto; overflow-x: auto;
       padding: 10px 12px;
       white-space: pre; font-family: var(--font); font-size: 12px;
-      line-height: 1.45; color: var(--text);
+      line-height: 1.45; background: var(--term-bg); color: var(--term-text);
       /* smooth scroll on mobile; contain stops scroll bleeding to page */
       -webkit-overflow-scrolling: touch;
       overscroll-behavior: contain;
     }
-    #output.placeholder { white-space: normal; color: var(--dim); font-style: italic; }
+    #output.placeholder { white-space: normal; color: var(--term-dim); font-style: italic; }
 
     /* ── byobu status line ── */
     #statusline {
@@ -304,8 +390,8 @@
       display: flex; flex-direction: column; gap: 4px; flex-shrink: 0;
     }
 
-    /* ── escape popup ── */
-    #escape-popup {
+    /* ── small anchored popups (escape/wrap, keyboard mode) ── */
+    .icon-popup {
       position: fixed; z-index: 150;
       background: var(--bg2); border: 1px solid var(--border);
       border-radius: 10px; padding: 5px;
@@ -313,15 +399,16 @@
       display: flex; flex-direction: column; gap: 2px;
       min-width: 120px;
     }
-    #escape-popup button {
+    .icon-popup button {
       background: transparent; color: var(--text);
       border: none; border-radius: 7px;
       padding: 11px 14px; font-size: 15px; font-family: var(--font);
       cursor: pointer; text-align: center; width: 100%;
       letter-spacing: 0.04em;
     }
-    #escape-popup button:active { background: var(--bg3); }
-    .escape-popup-sep { height: 1px; background: var(--border); margin: 2px 0; }
+    .icon-popup button:active { background: var(--bg3); }
+    .icon-popup button.current { color: var(--accent); }
+    .icon-popup-sep { height: 1px; background: var(--border); margin: 2px 0; }
 
     /* ── key bar (Esc, Ctrl, Tab, arrows for TUIs like vi) ── */
     #keybar {
@@ -472,6 +559,19 @@
     }
     #bio-never-btn:active { color: var(--text); }
   </style>
+  <script>
+    // ── theme bootstrap ── runs before first paint so a light-theme user
+    // never sees a dark flash. app.js re-applies on setting changes.
+    (function () {
+      var pref = localStorage.getItem('theme') || 'dark';
+      var t = pref === 'auto'
+        ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+        : pref;
+      document.documentElement.dataset.theme = t;
+      document.querySelector('meta[name="theme-color"]').content =
+        getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+    })();
+  </script>
 </head>
 <body>
 
@@ -580,6 +680,26 @@
   </div>
 </div>
 
+<!-- ── display settings (gear button in header) ── -->
+<div id="settings-overlay" style="display:none">
+  <div id="ctx-box">
+    <p class="settings-heading">Theme</p>
+    <div id="settings-theme-list"></div>
+    <div class="ctx-sep"></div>
+    <p class="settings-heading">Font</p>
+    <div id="settings-font-list"></div>
+    <div class="ctx-sep"></div>
+    <p class="settings-heading">Terminal font size</p>
+    <div id="settings-size-row">
+      <button class="icon-btn" id="settings-size-down" title="Smaller">−</button>
+      <span id="settings-size-value"></span>
+      <button class="icon-btn" id="settings-size-up" title="Larger">+</button>
+    </div>
+    <div class="ctx-sep"></div>
+    <button class="ctx-btn ctx-dim" id="settings-close">Close</button>
+  </div>
+</div>
+
 <div id="ios-install-tip" style="display:none">
   Tap the <strong>Share</strong> button&nbsp;⎋ below,<br>
   then <strong>"Add to Home Screen"</strong>
@@ -599,13 +719,15 @@
     <span id="header-clock"></span>
     <button id="btn-install" title="Install as app" style="display:none">+ Install app</button>
     <select id="machine-select" title="Switch machine" style="display:none"></select>
+    <button id="btn-settings" class="icon-btn" title="Display settings">⚙</button>
   </div>
 
   <div id="statusbar">
     <span id="ctx-name"></span>
+    <span id="kbd-mode-chip" style="display:none"></span>
     <button class="icon-btn" id="btn-create" title="New pane / window / session">+</button>
     <button class="icon-btn" id="btn-prev" title="Previous pane">‹</button>
-    <span id="xyz-label" title="Tap for next pane in this window">-/-</span>
+    <span id="xyz-label" title="Tap to refresh">-/-</span>
     <button class="icon-btn" id="btn-next" title="Next pane">›</button>
   </div>
 
@@ -653,12 +775,23 @@
   </div>
 
   <!-- ── escape / ctrl-c / key bar popup ── -->
-  <div id="escape-popup" style="display:none">
+  <div id="escape-popup" class="icon-popup" style="display:none">
     <button id="escape-popup-esc">⎋&nbsp; Esc</button>
-    <div class="escape-popup-sep"></div>
+    <div class="icon-popup-sep"></div>
     <button id="escape-popup-ctrlc">^C&nbsp; Ctrl-C</button>
-    <div class="escape-popup-sep"></div>
+    <div class="icon-popup-sep"></div>
     <button id="escape-popup-keys">⌨&nbsp; Key bar</button>
+    <div class="icon-popup-sep"></div>
+    <button id="escape-popup-wrap">⤶&nbsp; Wrap</button>
+  </div>
+
+  <!-- ── keyboard mode popup (tap $_ / Aa / **) ── -->
+  <div id="kbdmode-popup" class="icon-popup" style="display:none">
+    <button id="kbdmode-popup-terminal">$_&nbsp; Terminal</button>
+    <div class="icon-popup-sep"></div>
+    <button id="kbdmode-popup-text">Aa&nbsp; Text</button>
+    <div class="icon-popup-sep"></div>
+    <button id="kbdmode-popup-password">**&nbsp; Password</button>
   </div>
 
 </div>
