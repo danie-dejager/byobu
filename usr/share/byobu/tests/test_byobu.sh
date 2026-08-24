@@ -910,6 +910,69 @@ assert_true "osc133 bash: chains onto an existing PS1 rather than replacing it" 
 
 unset PS1 PROMPT_COMMAND PS0 rendered expected out want prompt_command_before ps1_before
 
+# Hyperlink-aware `ls` alias, coupled to this same shell-integration.bash --
+# see that file's tail for the rationale. Uses a fake `ls` on PATH rather
+# than the real one so both the "supports --hyperlink" and "doesn't" paths
+# are exercised deterministically, regardless of which coreutils version
+# actually happens to be installed on whatever machine runs this suite.
+# Each case runs in its own `bash -c` subshell (matching how Section 40
+# below isolates zsh) so alias/PATH state from one case can't leak into the
+# next, and so this doesn't disturb PS1/PROMPT_COMMAND/PS0 left set above.
+
+_fakebin=$(mktemp -d)
+cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) exit 0 ;;
+esac
+exec /bin/ls "$@"
+EOF
+chmod +x "$_fakebin/ls"
+
+# Each case reports an explicit sentinel ("ALIAS:<value>" or "NO_ALIAS")
+# rather than being scraped from `alias ls`'s own builtin output -- bash
+# prints a "not found"-style message to stderr for a missing alias, but
+# zsh's equivalent prints nothing at all (just a nonzero exit), so parsing
+# builtin wording is not portable between the two shells this same test
+# also has to cover below.
+_out=$(bash -c '
+	unalias ls 2>/dev/null
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: ls aliased with --hyperlink=auto when ls supports it and isn't already aliased" \
+	"printf %s \"\$_out\" | grep -q -- '--hyperlink=auto'"
+
+_out=$(bash -c '
+	alias ls="ls -F"
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: a pre-existing ls alias is left untouched, not overridden" \
+	"[ \"\$_out\" = \"ALIAS:alias ls='ls -F'\" ]"
+
+cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) echo "ls: unrecognized option '--hyperlink=auto'" >&2; exit 2 ;;
+esac
+exec /bin/ls "$@"
+EOF
+chmod +x "$_fakebin/ls"
+
+_out=$(bash -c '
+	unalias ls 2>/dev/null
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: no alias set when ls does not understand --hyperlink" \
+	"[ \"\$_out\" = NO_ALIAS ]"
+
+rm -rf "$_fakebin"; unset _fakebin _out
+
 # ---------------------------------------------------------------------------
 # Section 40 — OSC 133 shell integration (profiles/shell-integration.zsh)
 # ---------------------------------------------------------------------------
@@ -955,6 +1018,60 @@ if command -v zsh >/dev/null 2>&1; then
 		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PRECMD_OK"
 	assert_true "osc133 zsh: re-sourcing does not duplicate the PROMPT marker" \
 		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PROMPT_OK"
+
+	# Hyperlink-aware `ls` alias -- zsh counterpart to the bash cases above.
+	# Same fake-ls-on-PATH technique, for the same reason: deterministic
+	# regardless of the host's actual coreutils version.
+	_fakebin=$(mktemp -d)
+	cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) exit 0 ;;
+esac
+exec /bin/ls "$@"
+EOF
+	chmod +x "$_fakebin/ls"
+
+	# Explicit sentinels, not scraped `alias ls` wording -- see the bash
+	# cases above for why: zsh's own message (or total silence) for a
+	# missing alias isn't the same as bash's.
+	_zsh_out=$(zsh -c '
+		unalias ls 2>/dev/null
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: ls aliased with --hyperlink=auto when ls supports it and isn't already aliased" \
+		"printf %s \"\$_zsh_out\" | grep -q -- '--hyperlink=auto'"
+
+	_zsh_out=$(zsh -c '
+		alias ls="ls -F"
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: a pre-existing ls alias is left untouched, not overridden" \
+		"printf %s \"\$_zsh_out\" | grep -q 'ls -F'"
+
+	cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) echo "ls: unrecognized option '--hyperlink=auto'" >&2; exit 2 ;;
+esac
+exec /bin/ls "$@"
+EOF
+	chmod +x "$_fakebin/ls"
+
+	_zsh_out=$(zsh -c '
+		unalias ls 2>/dev/null
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: no alias set when ls does not understand --hyperlink" \
+		"[ \"\$_zsh_out\" = NO_ALIAS ]"
+
+	rm -rf "$_fakebin"; unset _fakebin
 
 	unset _zsh_script _zsh_out
 else

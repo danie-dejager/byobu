@@ -681,8 +681,22 @@ const C16_LIGHT = [
   '#555753','#c81e1e','#1c7d1c','#7a6000','#2a65b0','#8f5a8a','#0c7878','#303030',
 ];
 
-// Convert ANSI SGR escape codes to HTML spans.
-// Handles: 16/256/truecolor fg+bg, bold, italic, underline. Other sequences discarded.
+// Schemes allowed in an OSC 8 hyperlink target. Deliberately an allowlist,
+// not a blocklist: pane content is whatever a remote command chose to
+// print, so a scheme this doesn't recognize (javascript:, data:, vscode:,
+// file: -- anything that could act rather than just navigate) renders as
+// plain text instead of a clickable target. http/https covers the vast
+// majority of real hyperlink-emitting tools (ls --hyperlink, git, ripgrep);
+// mailto is the other common one (git blame/log author addresses).
+const _SAFE_HYPERLINK_SCHEMES = /^(https?|mailto):/i;
+
+function _sanitizeHyperlinkUrl(url) {
+  return _SAFE_HYPERLINK_SCHEMES.test(url) ? url : null;
+}
+
+// Convert ANSI SGR escape codes and OSC 8 hyperlinks to HTML.
+// Handles: 16/256/truecolor fg+bg, bold, italic, underline, OSC 8 links.
+// Other sequences discarded.
 function ansiToHtml(text) {
   // Palette follows the active theme; renders are theme-baked, so a theme
   // switch clears _paneCache and resubscribes (see rerenderTerminal).
@@ -701,7 +715,8 @@ function ansiToHtml(text) {
     return (ok(r) && ok(g) && ok(b)) ? `rgb(${r},${g},${b})` : null;
   }
   let fg = null, bg = null, bold = false, italic = false, ul = false;
-  let spanCss = null, out = '';
+  let linkHref = null; // current OSC 8 target, or null when not inside a link
+  let spanCss = null, spanLinkHref = null, out = '';
 
   function css() {
     const p = [];
@@ -712,15 +727,34 @@ function ansiToHtml(text) {
     if (ul) p.push('text-decoration:underline');
     return p.join(';');
   }
+  function esc(s) {
+    // Also escapes " (harmless in text content, and required wherever esc()
+    // feeds the href="..." attribute below -- an unescaped quote in a URL
+    // would otherwise close the attribute early and let the rest of the
+    // URL string inject arbitrary markup).
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
   function emit(s) {
     if (!s) return;
+    // The <a> wrapper and the <span> style are independent axes (a link's
+    // text can still change color mid-link), so each is opened/closed on
+    // its own change -- but a span must close before its enclosing <a>
+    // does, so a link-boundary change always closes the span first.
+    if (linkHref !== spanLinkHref) {
+      if (spanCss !== null) { out += '</span>'; spanCss = null; }
+      if (spanLinkHref !== null) out += '</a>';
+      if (linkHref !== null) {
+        out += `<a href="${esc(linkHref)}" target="_blank" rel="noopener noreferrer">`;
+      }
+      spanLinkHref = linkHref;
+    }
     const c = css();
     if (c !== spanCss) {
       if (spanCss !== null) out += '</span>';
       if (c) out += `<span style="${c}">`;
       spanCss = c || null;
     }
-    out += s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    out += esc(s);
   }
   function sgr(ps) {
     let i = 0;
@@ -746,12 +780,26 @@ function ansiToHtml(text) {
       i++;
     }
   }
-  const TOK = /([^\x1b]+)|\x1b(?:\[([0-9;]*)([A-Za-z])|\][^\x07\x1b]*(?:\x07|\x1b\\)|(.))/g;
+  // OSC 8 body looks like "8;params;URI" -- an empty URI (just "8;;") is
+  // the spec's own close marker. params (e.g. id=NNN, used by some
+  // emitters to associate a link split across lines) is unused here: this
+  // renders each captured OSC 8 span independently, which needs no such
+  // grouping.
+  function osc8(body) {
+    const rest = body.slice(2); // drop leading "8"
+    const semi = rest.indexOf(';');
+    if (semi === -1) return;
+    const uri = rest.slice(semi + 1);
+    linkHref = uri ? _sanitizeHyperlinkUrl(uri) : null;
+  }
+  const TOK = /([^\x1b]+)|\x1b(?:\[([0-9;]*)([A-Za-z])|\]([^\x07\x1b]*)(?:\x07|\x1b\\)|(.))/g;
   for (const m of text.matchAll(TOK)) {
     if (m[1])              emit(m[1]);
     else if (m[3] === 'm') sgr(m[2] ? m[2].split(';').map(Number) : [0]);
+    else if (m[4] !== undefined && m[4].charAt(0) === '8') osc8(m[4]);
   }
   if (spanCss !== null) out += '</span>';
+  if (spanLinkHref !== null) out += '</a>';
   return out;
 }
 

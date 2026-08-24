@@ -61,6 +61,19 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     only the latest such target is sent, the instant the outstanding one
     resolves. Local UI (position label, breadcrumb, cached content)
     still updates on every tap regardless
+  * trustmux/pwa: render OSC 8 hyperlinks (as emitted by `ls --hyperlink`,
+    git, ripgrep, and Claude Code's own CLI output) as clickable links
+    instead of silently discarding them -- the daemon already captured
+    them verbatim (capture-pane -e preserves OSC 8 byte for byte), only
+    the client-side renderer had nothing to do with them. Only
+    http(s)/mailto targets are ever linkified; any other scheme (e.g.
+    javascript:, data:) renders as plain text. Coupled to shell
+    integration for now: byobu-enable-shell-integration also aliases
+    `ls` to emit these links (--hyperlink=auto, only if ls isn't already
+    aliased and actually supports the flag), and
+    byobu-disable-shell-integration removes it along with everything
+    else -- one on/off switch for both, since there's no separate
+    opt-in yet
 
 byobu (7.18) 2026-08-14  Dustin Kirkland <kirkland@ubuntu.com>
 
