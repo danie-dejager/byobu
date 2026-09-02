@@ -278,8 +278,21 @@ case a daemon predating the upgrade is still serving on it.
 - In the default mode the daemon binds to `127.0.0.1` only — not reachable from the network
 - All traffic encrypted by Tailscale WireGuard; HTTPS via `tailscale serve`
 - No relay server — terminal data never leaves your Tailscale mesh
-- Pairing codes: 6-digit, 60-second TTL, single-use, max 3 attempts
+- Pairing codes: 6-digit, 60-second TTL, single-use, 3 wrong guesses per
+  address and 9 in total before the code is void; cross-site browser
+  requests to the pairing endpoint are refused
 - Session tokens: 256-bit random, stored at mode 0600
+- `stop` removes the `tailscale serve` mapping it created. In `start` mode the
+  daemon is plain HTTP on 127.0.0.1, and a mapping left pointing at that port
+  while nothing listens would let another local user bind it and receive your
+  phone's session cookie. `stop --keep-serve` keeps it anyway; `status` warns
+  while a mapping points at nothing. Between boot and your first login the
+  mapping exists and the daemon does not, so on a host shared with people you
+  do not trust prefer `start-local` or a systemd user unit that starts it at
+  boot.
+- The `start-direct` self-signed keypair is kept across restarts; `status`
+  prints its SHA-256 fingerprint so a browser's certificate warning can be
+  checked against it rather than clicked through
 
 ---
 

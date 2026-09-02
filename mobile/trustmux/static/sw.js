@@ -33,10 +33,15 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
-  // Pass API endpoints, main HTML, and JS straight to the network.
-  if (NETWORK_ONLY.some(p => url.pathname === p || url.pathname.startsWith(p))) return;
+  // Pass API endpoints, main HTML, and JS straight to the network.  Exact
+  // matches only: with startsWith(), '/' matched every request and the
+  // cache branch below was dead code -- harmless, but not what the comments
+  // promised, and one edit away from caching authenticated responses.
+  if (NETWORK_ONLY.includes(url.pathname)) return;
 
-  // Cache-first only for the truly static assets listed in SHELL.
+  // Cache-first only for the truly static assets listed in SHELL; anything
+  // else goes to the network and is never stored.
+  if (!SHELL.includes(url.pathname + url.search)) return;
   e.respondWith(
     caches.match(e.request).then(cached => cached || fetch(e.request))
   );

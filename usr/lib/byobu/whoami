@@ -40,7 +40,7 @@ __whoami_detail() {
 __whoami() {
 	local user=$(___get_user)
 	[ -n "$user" ] || return
-	color bold2; printf "%s@" "$user"; color -
+	color bold2; printf_status "$user@"; color -
 }
 
 # vi: syntax=sh ts=4 noexpandtab

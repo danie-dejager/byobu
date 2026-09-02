@@ -20,35 +20,54 @@ jobs:
     environment: pypi
 
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs, not tags: this job holds
+      # id-token: write for the pypi environment, so a retagged action would
+      # be able to publish arbitrary trustmux releases.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set version from tag
         if: github.event_name == 'push'
         run: |
           # Strip leading 'trustmux-v' from tag name
           VERSION="${GITHUB_REF_NAME#trustmux-v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?((a|b|rc)[0-9]+)?$'; then
+            echo "::error::tag $GITHUB_REF_NAME does not carry a valid version" >&2
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Set version from input
         if: github.event_name == 'workflow_dispatch'
-        run: echo "VERSION=${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
+        # Through env, never interpolated into the script: a value such as
+        # 1.0"; curl ... would otherwise run.  And it has to look like a
+        # version before it is written to $GITHUB_ENV (a newline would add
+        # arbitrary variables).
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION_INPUT" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?((a|b|rc)[0-9]+)?$'; then
+            echo "::error::invalid version '$VERSION_INPUT'" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION_INPUT" >> "$GITHUB_ENV"
 
       - name: Stamp version in pyproject.toml
         run: sed -i "s/^version = .*/version = \"$VERSION\"/" mobile/pyproject.toml
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
       - name: Install build tools
-        run: pip install build
+        run: pip install build==1.6.0
 
       - name: Build sdist and wheel
         working-directory: mobile
         run: python -m build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: mobile/dist/
+          attestations: true

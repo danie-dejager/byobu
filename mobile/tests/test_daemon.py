@@ -348,10 +348,18 @@ class TestPairHandler(AsyncHTTPTestCase):
             resp = self._post({'code': dashed})
         self.assertEqual(resp.code, 200)
 
-    def test_too_many_attempts_returns_429(self):
+    def test_too_many_attempts_in_total_returns_429(self):
+        bm._pair_code = '111111'
+        bm._pair_code_mono_expiry = time.monotonic() + 300
+        bm._pair_attempts = bm._MAX_PAIR_ATTEMPTS_TOTAL
+        resp = self._post({'code': '111111'})
+        self.assertEqual(resp.code, 429)
+
+    def test_too_many_attempts_from_this_address_returns_429(self):
         bm._pair_code = '111111'
         bm._pair_code_mono_expiry = time.monotonic() + 300
         bm._pair_attempts = bm._MAX_PAIR_ATTEMPTS
+        bm._pair_attempts_by_ip['127.0.0.1'] = bm._MAX_PAIR_ATTEMPTS
         resp = self._post({'code': '111111'})
         self.assertEqual(resp.code, 429)
 

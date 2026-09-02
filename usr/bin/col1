@@ -19,11 +19,20 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Installed as col1, col2, ... : the column number comes from the name we
+# were invoked by.  It is passed to awk as a variable, never spliced into
+# the program text, and it has to be a number.
+n=${0##*/}
+n=${n#col}
+case "$n" in
+    ""|*[!0-9]*)
+        echo "ERROR: $0 must be invoked as colN, where N is a column number" >&2
+        exit 1
+    ;;
+esac
 if [ $# -gt 0 ]; then
-    ifs='-F'"$1"
+    sep="$1"
     shift || true
-else
-    ifs="-F "
+    exec awk -F "$sep" -v n="$n" -- '{print $n}' "$@"
 fi
-b=$(basename $0)
-awk "$ifs" '{print $'${b#col}'}' "$@"
+exec awk -v n="$n" -- '{print $n}' "$@"

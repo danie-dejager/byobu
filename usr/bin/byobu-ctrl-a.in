@@ -45,7 +45,7 @@ case "$BYOBU_BACKEND" in
 		fi
 	;;
 	"tmux")
-		if grep -qs "^set -g prefix" "$keybindings"e;  then
+		if grep -qs "^set -g prefix" "$keybindings"; then
 			# Check for escape definition in local keybindings config
 			bind_to="emacs"
 		fi

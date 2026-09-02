@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from trustmux._ctl import cmd_stop
-from trustmux._enable import is_hook_for
+from trustmux._enable import is_hook_for, rewrite_in_place
 from trustmux._paths import Instance
 
 _LOGIN_FILES = [
@@ -22,7 +22,7 @@ def _remove_hook(dest: Path, inst: Instance | None = None) -> None:
     # Only this instance's hook: disabling one must not un-enable the others.
     filtered = [l for l in lines if not is_hook_for(l, inst)]
     if len(filtered) < len(lines):
-        dest.write_text("".join(filtered))
+        rewrite_in_place(dest, "".join(filtered))
 
 
 def main(inst: Instance | None = None) -> None:

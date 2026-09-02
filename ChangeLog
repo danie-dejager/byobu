@@ -28,7 +28,56 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     safety property worth keeping. Voice input deliberately not
     included -- Android's own keyboard already has voice-to-text built
     in
-
+  * security: fixes from the 2026-09 security audit (CVE requests pending
+    for the first four)
+    - manifest: validate package names and pass "--" before them; a
+      pastebin or file listing could put apt options such as
+      -oDPkg::Pre-Invoke::= on a "sudo apt install" command line (root
+      command execution); URL import is now https-only and confirms
+    - battery: parse /sys uevent instead of sourcing it as shell; a USB
+      HID battery/UPS with a crafted model or serial string could run
+      code as the user on every status refresh
+    - tmpfsffs: move /tmp entries with find -exec mv -t -- rather than a
+      shell glob, which let a local user's file named like an mv option
+      redirect root's moves; refuse to run as non-root
+    - select-session.py: remove eval() of the session-chooser answer, a
+      restricted-shell (ForceCommand/rbash/kiosk) escape
+    - trustmux: "stop"/"disable"/"rm" remove the tailscale serve mapping
+      they created and "status" warns while one points at nothing; in
+      serve mode the daemon is plain HTTP on 127.0.0.1, and a mapping
+      left behind let another local user bind the port and receive the
+      phone's session cookie
+    - trustmux: keep the start-direct TLS keypair across restarts and
+      print its SHA-256 fingerprint in "status", instead of a new
+      certificate (and a new browser warning) on every start
+    - trustmux: /pair refuses cross-site browser requests and non-JSON
+      bodies, and counts wrong guesses per source address (3) with a total
+      cap (9), so one peer cannot lock the real phone out
+    - trustmux: instance config file is opened O_NOFOLLOW and must be a
+      regular file owned by the user with non-writable parents (it can
+      name a program the daemon runs); instance names are matched with
+      fullmatch; ~/.profile edits are atomic; the pairing User-Agent is
+      stripped to printable ASCII
+    - trustmux/pwa: allow the inline theme script by CSP hash (it was
+      silently blocked) and add object-src/base-uri/form-action/
+      frame-ancestors; fix the service worker's dead cache logic; drop the
+      pairing code from the URL as soon as it is read; show OSC 8 link
+      targets on long-press
+    - status scripts escape "#" for tmux (hostname, release, distro,
+      whoami) so data cannot reach tmux's format engine; byobu-ugraph uses
+      mktemp and no eval; byobu-ulevel checks numeric options and no longer
+      evals user themes; wifi-status, byobu-layout, col1, byobu-quiet,
+      whats-my-public-ip, purge-old-kernels, updates_available and
+      include/dirs hardened; byobu-ctrl-a stray-character bug fixed
+    - release.py: build output, tap clones and tarballs live under
+      ~/.cache/byobu-release (0700) instead of predictable /tmp paths;
+      .orig.tar.gz is verified against git archive HEAD and the .dsc
+      before signing; signing always asks; salsa/debian/latest changes
+      since the last signed release are shown; urlopen timeouts
+    - GitHub Actions pinned by commit SHA; workflow_dispatch version goes
+      through env and is validated; PyPI attestations enabled
+    - experimental/byobu-classroom: random guest password, sshd changes
+      confined to the Match block, user names validated
   * trustmux/pwa: add opt-in OSC 133 shell integration
     (byobu-enable-shell-integration / byobu-disable-shell-integration) --
     prompt/command boundary markers for Trustmux's own future prompt

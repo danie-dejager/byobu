@@ -462,6 +462,45 @@ def _ensure_ts_serve(port: int = DEFAULT_PORT) -> bool:
     return False
 
 
+def _remove_ts_serve(port: int) -> bool:
+    """Remove the tailscale serve mapping for port. Returns True if gone.
+
+    A mapping that outlives the daemon keeps forwarding the tailnet name to a
+    loopback port nothing of ours is listening on -- which any other local user
+    could then bind, and be handed the phone's session cookie.
+    """
+    try:
+        subprocess.run(["tailscale", "serve", "--bg", str(port), "off"],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+    try:
+        out = subprocess.check_output(["tailscale", "serve", "status"],
+                                      stderr=subprocess.DEVNULL, text=True, timeout=15)
+        if f":{port}" not in out:
+            return True     # already gone, whoever removed it
+    except Exception:
+        pass
+    print("Warning: could not remove the tailscale serve mapping for port "
+          f"{port}.", file=sys.stderr)
+    print("  Until the daemon is running again, that mapping forwards your tailnet "
+          "name to a loopback port", file=sys.stderr)
+    print("  any local user could bind. Remove it by hand:", file=sys.stderr)
+    print(f"    tailscale serve --bg {port} off      (or: tailscale serve reset)",
+          file=sys.stderr)
+    return False
+
+
+def _serve_marker_port(inst: Instance) -> int | None:
+    """Port recorded in this instance's serve marker, if it has one."""
+    try:
+        return _valid_port(inst.serve_marker.read_text().strip())
+    except OSError:
+        return None
+
+
 def _launch(port: int, extra_args: list[str], inst: Instance | None = None) -> int | None:
     """Launch daemon as a detached background process. Returns PID or None."""
     inst = inst or Instance()
@@ -661,6 +700,8 @@ def cmd_start(mode: str = "serve", port: int | None = None,
             return 1
         if not _ensure_ts_serve(port):
             return 1
+        _ensure_dir(inst)
+        inst.serve_marker.write_text(f"{port}\n")
         print("Starting trustmux (HTTPS mode)...")
         pid = _launch(port, adv + ["--host", "127.0.0.1", "--https"], inst)
         ok = pid is not None
@@ -715,7 +756,26 @@ def cmd_start(mode: str = "serve", port: int | None = None,
     return 0
 
 
-def cmd_stop(port: int | None = None, inst: Instance | None = None) -> int:
+def _teardown_serve(inst: Instance, keep_serve: bool) -> None:
+    """After a stop: remove the serve mapping this instance set up, unless asked
+    to keep it, in which case say what keeping it means."""
+    served = _serve_marker_port(inst)
+    if served is None:
+        return
+    if keep_serve:
+        print(f"Note: tailscale serve still forwards https://<tailnet-name> to "
+              f"127.0.0.1:{served} with nothing listening.")
+        print("  On a shared host another user could bind that port. "
+              f"Start again soon, or run: trustmux stop{inst.label()}")
+        return
+    if _remove_ts_serve(served):
+        print(f"tailscale serve mapping for port {served} removed "
+              "(start will recreate it)")
+        inst.serve_marker.unlink(missing_ok=True)
+
+
+def cmd_stop(port: int | None = None, inst: Instance | None = None,
+             keep_serve: bool = False) -> int:
     inst = inst or Instance()
     port = resolve_port(port, inst)
     p = _pid(port, inst)
@@ -730,8 +790,13 @@ def cmd_stop(port: int | None = None, inst: Instance | None = None) -> int:
             os.kill(legacy_p, signal.SIGTERM)
             print(f"trustmux stopped (pid {legacy_p}) — this was a pre-upgrade "
                   "daemon at the old socket location.")
+            _teardown_serve(inst, keep_serve)
             return 0
         print("trustmux not running")
+        # A daemon that died on its own leaves its mapping behind just as a
+        # stop would; a second `stop` is the natural way to clean that up.
+        if not (socket_is_live(inst.sock) and _recorded(inst)):
+            _teardown_serve(inst, keep_serve)
         # "Nothing found on *this* port" does not mean the pid file is stale
         # -- it may correctly be tracking this instance's daemon on another
         # port, which the live socket shows.  Without a live socket there is
@@ -758,6 +823,7 @@ def cmd_stop(port: int | None = None, inst: Instance | None = None) -> int:
     os.kill(p, signal.SIGTERM)
     print(f"trustmux stopped (pid {p})")
     inst.pid_file.unlink(missing_ok=True)
+    _teardown_serve(inst, keep_serve)
     return 0
 
 
@@ -774,9 +840,30 @@ def cmd_status(port: int | None = None, inst: Instance | None = None) -> int:
             print("  Run 'trustmux restart' to move it to the new one.")
             return 0
         print("trustmux not running")
+        served = _serve_marker_port(inst)
+        if served is not None:
+            try:
+                out = subprocess.check_output(["tailscale", "serve", "status"],
+                                              stderr=subprocess.DEVNULL, text=True,
+                                              timeout=15)
+            except Exception:
+                out = ""
+            if f":{served}" in out:
+                print(f"Warning: tailscale serve still forwards https://<tailnet-name> "
+                      f"to 127.0.0.1:{served}, where nothing is listening.")
+                print("  On a shared host another user could bind that port and "
+                      "receive your phone's session cookie.")
+                print(f"  Run: trustmux start{inst.label()}   or   "
+                      f"trustmux stop{inst.label()}  (removes the mapping)")
+            else:
+                inst.serve_marker.unlink(missing_ok=True)
         return 0
 
     print(f"trustmux running (pid {p}) — port {port}")
+    fp = (info or {}).get("fingerprint")
+    if isinstance(fp, str) and fp:
+        print(f"  TLS certificate SHA-256: {fp}")
+        print("  (compare with what your browser shows before accepting it)")
     # An advertised address is what the daemon certified and what pair prints,
     # so it wins over the tailnet name here as well.
     if not advertised_urls(info):
@@ -874,6 +961,9 @@ def cmd_rm(inst: Instance | None = None, force: bool = False) -> int:
     from trustmux._disable import _LOGIN_FILES, _remove_hook
     for f in _LOGIN_FILES:
         _remove_hook(f, inst)
+    # And a mapping left behind would forward the tailnet to a dead port.
+    if not running:
+        _teardown_serve(inst, keep_serve=False)
 
     had_tokens = inst.tokens_file.exists()
     try:
@@ -931,7 +1021,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="trustmux",
         description="Manage the Trustmux daemon",
-        epilog="To remove tailscale serve config: tailscale serve reset",
+        epilog="stop removes the tailscale serve mapping it created; "
+               "to remove all serve config: tailscale serve reset",
     )
     sub = parser.add_subparsers(dest="cmd")
 
@@ -969,7 +1060,11 @@ def main() -> None:
     sub.add_parser("serve",        parents=starting, help=argparse.SUPPRESS)   # alias
     sub.add_parser("start-local",  parents=starting, help="Start daemon loopback-only for SSH tunnel access")
     sub.add_parser("start-direct", parents=starting, help="Start daemon direct HTTPS (self-signed cert, no Tailscale)")
-    sub.add_parser("stop",         parents=both, help="Stop daemon (tailscale serve config persists)")
+    p_stop = sub.add_parser("stop", parents=both,
+                            help="Stop daemon and remove its tailscale serve mapping")
+    p_stop.add_argument("--keep-serve", action="store_true",
+                        help="Leave the tailscale serve mapping in place (it then "
+                             "forwards to a loopback port nothing is listening on)")
     sub.add_parser("restart",      parents=starting, help="Restart daemon")
     sub.add_parser("status",       parents=both, help="Show running status and URL")
     sub.add_parser("enable",       parents=starting, help="Start daemon and install login hook for automatic start")
@@ -1009,14 +1104,14 @@ def main() -> None:
     elif cmd == "start-direct":
         sys.exit(cmd_start("start-direct", port, inst, adv, no_adv))
     elif cmd == "stop":
-        sys.exit(cmd_stop(port, inst))
+        sys.exit(cmd_stop(port, inst, keep_serve=args.keep_serve))
     elif cmd == "restart":
         # restart brings the daemon back in serve mode, so check the serve
         # restriction before stopping anything -- otherwise a named instance
         # gets stopped and then refused, leaving it down.
         if not can_use_serve(inst):
             sys.exit(1)
-        cmd_stop(port, inst)
+        cmd_stop(port, inst, keep_serve=True)
         time.sleep(0.5)
         sys.exit(cmd_start("serve", port, inst, adv, no_adv))
     elif cmd == "status":

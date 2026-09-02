@@ -1,5 +1,16 @@
 #!/bin/sh
+# Print this host's public IP address, as seen from the internet.
+# https only, fail on HTTP errors, bounded time, and the answer has to look
+# like an address before it is printed: this can end up in a status bar.
 
-#wget http://ipinfo.io/ip -qO -
-
-curl -s checkip.dyndns.org | sed -e 's/.*Current IP Address: //' -e 's/<.*$//'
+ip=""
+for url in https://checkip.amazonaws.com https://ipinfo.io/ip https://api.ipify.org; do
+	ip=$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+	case "$ip" in
+		"") continue ;;
+		*[!0-9a-fA-F.:]*) ip=""; continue ;;
+	esac
+	break
+done
+[ -n "$ip" ] || exit 1
+printf '%s\n' "$ip"
