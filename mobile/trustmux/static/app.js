@@ -744,7 +744,9 @@ function ansiToHtml(text) {
       if (spanCss !== null) { out += '</span>'; spanCss = null; }
       if (spanLinkHref !== null) out += '</a>';
       if (linkHref !== null) {
-        out += `<a href="${esc(linkHref)}" target="_blank" rel="noopener noreferrer">`;
+        // title shows the real destination on long-press/hover: OSC 8 lets the
+        // link text say one host while the href goes to another.
+        out += `<a href="${esc(linkHref)}" title="${esc(linkHref)}" target="_blank" rel="noopener noreferrer">`;
       }
       spanLinkHref = linkHref;
     }
@@ -1556,8 +1558,15 @@ function showPairScreen() {
   pairCodeInput.value = '';
   pairError.textContent = '';
   if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
-  const autoCode = (window.location.hash.slice(1) || '').replace(/\D/g, '').slice(0, 6);
-  if (autoCode && /^\d{6}$/.test(autoCode)) {
+  // Take the code out of the URL bar and history as soon as it has been
+  // read, whether or not pairing then succeeds; and only auto-submit a
+  // fragment that is exactly a code, so a stray link cannot spend a guess.
+  const fragment = window.location.hash.slice(1) || '';
+  if (window.location.hash) {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  }
+  const autoCode = /^\d{6}$/.test(fragment) ? fragment : '';
+  if (autoCode) {
     pairCodeInput.value = `${autoCode.slice(0,3)}-${autoCode.slice(3)}`;
     setTimeout(submitPair, 400);
   } else {
