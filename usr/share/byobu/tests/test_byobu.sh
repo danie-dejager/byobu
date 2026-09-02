@@ -1275,11 +1275,22 @@ rm -rf "$_col_tmp"; unset _col_tmp
 # no file), silently verifying nothing in that environment.
 _resolve_or_installed() {
 	# $1: script base name (no .in). Echoes whichever exists.
-	if [ -r "${BYOBU_PREFIX}/bin/$1.in" ]; then
-		printf '%s' "${BYOBU_PREFIX}/bin/$1.in"
-	else
-		printf '%s' "${BYOBU_PREFIX}/bin/$1"
+	local f="${BYOBU_PREFIX}/bin/$1.in"
+	[ -r "$f" ] || f="${BYOBU_PREFIX}/bin/$1"
+	# Nix wraps an installed binary in a thin launcher (PATH/BYOBU_PYTHON
+	# setup) that execs the real script renamed to a leading-dot file in
+	# the same directory -- confirmed directly against a real Nix build:
+	# /nix/store/.../bin/byobu-layout is 638 bytes of wrapper with none of
+	# the real logic text, while .../bin/.byobu-layout (4KB) has it. A
+	# content grep against the wrapper finds nothing either way, so
+	# assert_false "passes" for the wrong reason and assert_true fails
+	# outright -- follow the wrapper's own exec line to the real file.
+	if grep -q 'exec -a ' "$f" 2>/dev/null; then
+		local real
+		real=$(sed -n 's/.*exec -a "[^"]*" "\([^"]*\)".*/\1/p' "$f" | head -1)
+		[ -n "$real" ] && [ -r "$real" ] && f="$real"
 	fi
+	printf '%s' "$f"
 }
 _ugraph=$(_resolve_or_installed byobu-ugraph)
 _layout=$(_resolve_or_installed byobu-layout)

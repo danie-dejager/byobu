@@ -43,6 +43,22 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     ones failed outright. Verified against a real dpkg-buildpackage
     build + install (not just source-tree): 225 passing, was 220 passed
     / 5 failed
+  * usr/bin/Makefile.am: install whats-my-public-ip -- like tmpfsffs, it
+    has been missing from dist_bin_SCRIPTS since it was added and so
+    never actually shipped in any package. Its own new test masked this
+    as a false pass rather than a failure (a negated assert_true against
+    a missing file is trivially true), which is why it went unnoticed
+    until checked directly against a real build
+  * usr/share/byobu/tests/test_byobu.sh: the ulevel/ugraph/layout
+    install-fallback fix above still failed once packaged with Nix
+    specifically: nixpkgs wraps these particular binaries in a thin
+    launcher (PATH/BYOBU_PYTHON setup) that execs the real script
+    renamed to a leading-dot file in the same directory, so a content
+    grep against the installed path hit the wrapper, not the real
+    logic -- same masking problem, one layer deeper. Fixed by following
+    the wrapper's own exec line to the real file when present. Verified
+    against a real `nix-build` of this source tree (not just Debian):
+    223 passing, was 222 passed / 1 failed
   * security: fixes from the 2026-09 security audit (CVE requests pending
     for the first three; a fourth, in tmpfsffs, no longer applies now
     that tmpfsffs has been removed rather than fixed -- see above)
