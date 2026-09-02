@@ -1851,6 +1851,171 @@ def verify_orig_tarballs(outdir, subdirs, pkg):
         die(f"No {pkg}_*.orig.tar.gz found under {outdir} to verify")
 
 
+def _tar_content_diff(a, b):
+    """Compare two .tar.xz archives by member content (name, kind, and for
+    files/symlinks their bytes/target), ignoring the tar stream's own
+    encoding: member order, embedded timestamps, and xz compression
+    settings are not guaranteed identical between two independent builds
+    of byte-identical input, so comparing compressed bytes directly gives
+    false positives (confirmed directly: a real second build of unmodified
+    input differed in raw bytes, but every extracted file was identical).
+    Returns a list of human-readable mismatch descriptions (empty if the
+    two archives' actual content is the same)."""
+    import tarfile
+
+    def _members(path):
+        out = {}
+        with tarfile.open(path, "r:xz") as tf:
+            for m in tf.getmembers():
+                parts = Path(m.name).parts
+                rel = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+                if m.isdir():
+                    out[rel] = ("dir", None)
+                elif m.issym() or m.islnk():
+                    out[rel] = ("link", m.linkname)
+                elif m.isfile():
+                    out[rel] = ("file", tf.extractfile(m).read())
+        return out
+
+    got, want = _members(a), _members(b)
+    problems = []
+    for extra in sorted(set(got) - set(want)):
+        problems.append(f"present but not expected: {extra}")
+    for missing in sorted(set(want) - set(got)):
+        problems.append(f"expected but missing: {missing}")
+    for common in sorted(set(got) & set(want)):
+        gk, gv = got[common]
+        wk, wv = want[common]
+        if gk != wk:
+            problems.append(f"{common}: {a.name} is a {gk}, {b.name} is a {wk}")
+        elif gv != wv:
+            problems.append(f"content differs: {common}")
+    return problems
+
+
+def verify_native_tarballs(outdir, pkg):
+    """RC/PPA builds force debian/source/format to "3.0 (native)"
+    (_PPA_SERIES_SCRIPT) -- a native package has no separate orig tarball
+    at all, just one combined {pkg}_{version}.tar.xz, so verify_orig_tarballs
+    (which looks for {pkg}_*.orig.tar.gz) can never find anything there and
+    was never meant to cover this path. That doesn't mean nothing needs
+    checking: the same threat verify_orig_tarballs exists for -- a
+    compromised build container (pulled by mutable tag) producing source
+    that didn't actually come from this git checkout, then getting signed
+    with the maintainer's real key -- applies just as much here, and the
+    PPA is a real channel real users install from, not just RC scaffolding.
+
+    Rebuilds the same source package fresh, in a throwaway container, from
+    this exact checkout, and requires the result to have identical content
+    (see _tar_content_diff) to what the original build container produced.
+    A first attempt at this compared extracted file trees directly and hit
+    a real false positive: dpkg-source silently drops VCS metadata
+    (.gitignore, .gitattributes, .bzrignore, ...) from the tarball it
+    builds, so a naive "does every git-archived file appear in the
+    tarball" check flags legitimate output as tampered. Reusing the real
+    dpkg-source tool for the comparison side-steps needing to know (and
+    keep in sync with) its exact exclusion rules -- if a future dpkg
+    version changes what it drops, both sides of the comparison change
+    together automatically. Only genuine unreproducibility risk: debian/
+    changelog's synthetic top stanza embeds a build-time `date -R`
+    timestamp with no fixed value to reproduce -- and no security property
+    worth verifying anyway, since a tampered container could fake a
+    plausible-looking one just as easily as a real one -- so it's read
+    verbatim from the real tarball and reused rather than regenerated.
+    Everything after that stanza in debian/changelog is checked against
+    the currently-fetched salsa/debian/latest explicitly, since that
+    genuinely is meant to be reproducible and is exactly the kind of
+    thing worth catching tampering in.
+    """
+    import tarfile
+    import tempfile
+    debian_dir = BYOBU_SRC / "debian"
+    if not debian_dir.is_dir():
+        die("verify_native_tarballs(): debian/ not present -- call inside "
+            "the prepare_debian()/cleanup_debian() window")
+    checked = 0
+    for tb in sorted((outdir / "ppa").glob(f"{pkg}_*.tar.xz")):
+        ppa_ver = tb.name[len(pkg) + 1:-len(".tar.xz")]
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            with tarfile.open(tb, "r:xz") as tf:
+                tf.extractall(tdp, filter="data")
+            roots = [p for p in tdp.iterdir() if p.is_dir()]
+            if len(roots) != 1:
+                die(f"{tb.name}: expected exactly one top-level directory, found {len(roots)}")
+            got_root = roots[0]
+
+            fmt = (got_root / "debian" / "source" / "format").read_text()
+            if fmt != "3.0 (native)\n":
+                die(f"{tb.name}: debian/source/format is {fmt!r}, expected "
+                    f"'3.0 (native)\\n' -- refusing to sign.")
+
+            got_changelog = (got_root / "debian" / "changelog").read_text().splitlines(keepends=True)
+            synthetic_stanza = "".join(got_changelog[:6])  # 3 printf calls x 2 lines each
+            real_changelog = got_changelog[6:]
+            want_changelog = debian_dir.joinpath("changelog").read_text().splitlines(keepends=True)
+            if real_changelog != want_changelog:
+                die(f"{tb.name}: debian/changelog (after the synthetic top stanza) does "
+                    f"not match the currently-fetched salsa/debian/latest changelog.\n"
+                    f"  Do not sign it. (--no-verify-orig skips this check.)")
+
+        # Rebuild in a throwaway container, not on the host: dpkg-buildpackage
+        # -S still needs `debian/rules clean`, which needs debhelper -- a
+        # real new dependency this function would otherwise impose on
+        # whatever machine runs release.py, unlike every other check here.
+        # Every actual build in this file already runs in Docker for
+        # exactly this reason; the verification rebuild should too, reusing
+        # the same toolchain-install list _PPA_SERIES_SCRIPT itself uses.
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            srcdir = tdp / f"{pkg}-{ppa_ver}"
+            srcdir.mkdir()
+            run(["bash", "-c",
+                 f"git -C {shlex.quote(str(BYOBU_SRC))} archive HEAD | "
+                 f"tar -x -C {shlex.quote(str(srcdir))}"])
+            shutil.copytree(debian_dir, srcdir / "debian")
+            (srcdir / "debian" / "source" / "format").write_text("3.0 (native)\n")
+            (srcdir / "debian" / "changelog").write_text(synthetic_stanza + "".join(want_changelog))
+            run([
+                "docker", "run", "--rm", "-v", f"{tdp}:/build",
+                "ubuntu:noble", "bash", "-c",
+                "set -eo pipefail; export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -qq; "
+                "apt-get install -y --no-install-recommends "
+                "build-essential dpkg-dev debhelper dh-python "
+                "gettext-base automake autoconf "
+                "python3 python3-all python3-cryptography python3-tornado "
+                "devscripts bc ca-certificates >/dev/null 2>&1; "
+                f"cd /build/{shlex.quote(srcdir.name)} && "
+                "dpkg-buildpackage -S -us -uc -d",
+            ])
+            rebuilt = tdp / f"{pkg}_{ppa_ver}.tar.xz"
+            if not rebuilt.is_file():
+                die(f"verify_native_tarballs(): container rebuild of {tb.name} produced no "
+                    f"{rebuilt.name}")
+            # Compare actual member content, not compressed bytes: two
+            # independent dpkg-source/xz invocations over byte-identical
+            # input do not necessarily produce byte-identical .tar.xz
+            # files (tar-stream member order, embedded timestamps, xz
+            # settings are not guaranteed reproducible without deliberate
+            # extra effort -- confirmed directly: a real rebuild of
+            # unmodified input differed in raw bytes but `diff -rq
+            # --no-dereference` on the two extracted trees found nothing).
+            mismatches = _tar_content_diff(tb, rebuilt)
+            if mismatches:
+                detail = "\n    ".join(mismatches[:20])
+                more = f"\n    … and {len(mismatches) - 20} more" if len(mismatches) > 20 else ""
+                die(f"{tb.name} does not match a fresh rebuild of the same checkout "
+                    f"(same git HEAD, same salsa/debian/latest, same synthetic changelog "
+                    f"stanza):\n    {detail}{more}\n"
+                    f"  The build container produced source that is not this tree.\n"
+                    f"  Do not sign it. (--no-verify-orig skips this check.)")
+        checked += 1
+        print(f"  ✓ {tb.name} matches a fresh rebuild of git archive HEAD + salsa/debian/latest")
+    if not checked:
+        die(f"No {pkg}_*.tar.xz found under {outdir}/ppa to verify")
+
+
 def sign_and_upload(v, identity, mode, verify_orig=True):
     section("Phase 7: Sign and upload" if mode == "rc" else "Phase 8: Sign and upload")
     outdir = v["outdir"]
@@ -1861,7 +2026,16 @@ def sign_and_upload(v, identity, mode, verify_orig=True):
     print(f"\n── Step 1: GPG signing  (key: {gpgkey})")
     subdirs = ["ppa"] if mode == "rc" else ["debian", "ubuntu"]
     if verify_orig:
-        verify_orig_tarballs(outdir, subdirs, v["pkg"])
+        if mode == "rc":
+            # RC/PPA builds force native format (_PPA_SERIES_SCRIPT) -- one
+            # combined .tar.xz, no separate .orig.tar.gz -- unlike final's
+            # debian/ubuntu subdirs, which both keep real quilt format with
+            # a genuine orig tarball. See verify_native_tarballs for why
+            # this still needs its own, differently-shaped verification
+            # rather than just being skipped.
+            verify_native_tarballs(outdir, v["pkg"])
+        else:
+            verify_orig_tarballs(outdir, subdirs, v["pkg"])
     debian_sha = review_debian_latest()
     to_sign = [f for subdir in subdirs
                for f in sorted((outdir / subdir).glob("*_source.changes"))]
