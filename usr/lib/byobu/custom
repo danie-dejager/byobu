@@ -63,7 +63,9 @@ __custom() {
 		rm -f "$BYOBU_RUN_DIR/status.$BYOBU_BACKEND/custom"*
 		return
 	fi
-	printf "$output" | $BYOBU_SED ':a;N;$!ba;s/\n//g'
+	# %s: escapes in a coloured script's output were already expanded above,
+	# and a plain one's "%" or "\\" must not be interpreted here
+	printf "%s" "$output" | $BYOBU_SED ':a;N;$!ba;s/\n//g'
 }
 
 # vi: syntax=sh ts=4 noexpandtab

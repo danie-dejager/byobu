@@ -390,9 +390,26 @@ list_themes()
 
 theme_valid()
 {
-  theme="$1"
-  [ -z "`list_themes|grep "^${theme}$"`" ] && return 1
-  return 0
+  # exact match, not a regex: the name is interpolated into ${theme[i]}
+  local entry
+  for entry in ${theme_list[@]}
+  do
+    [ "$entry" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# -c/-m/-x/-w/-e values are spliced into bc(1) programs and arithmetic, and
+# byobu-ugraph feeds -c from data files; anything but a number is refused
+# before it can get there.
+is_number()
+{
+  [[ "$1" =~ ^-?[0-9]+(\.[0-9]*)?$ ]] || [[ "$1" =~ ^-?\.[0-9]+$ ]]
+}
+
+assert_number()
+{
+  is_number "$2" || die "$1 must be a number, not '$2'"
 }
 
 check_a11y
@@ -477,15 +494,22 @@ done
 
 shift $[$OPTIND-1]
 
+[ -n "$current" ] && assert_number "-c" "$current"
+[ -n "$min" ]     && assert_number "-m" "$min"
+[ -n "$max" ]     && assert_number "-x" "$max"
+[ -n "$width" ]   && assert_number "-w" "$width"
+[ -n "$decimal_places" ] && assert_number "-e" "$decimal_places"
+
 if [ ! -z "$user_theme" ]
 then
-  elements=$(echo "$user_theme"|awk '{print NF}')
+  read -r -a _user_glyphs <<< "$user_theme"
+  elements=${#_user_glyphs[@]}
 
   assert "$elements >= 2" "user themes need >= 2 values"
 
-  # create new theme
+  # create new theme; the glyphs go in as array elements, never through eval
   name="_user_${elements}"
-  eval "$name=($user_theme)"
+  eval "$name=(\"\${_user_glyphs[@]}\")"
 
   # add it to list
   theme_list=("${theme_list[@]}" $name)

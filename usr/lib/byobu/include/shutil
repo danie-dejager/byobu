@@ -112,6 +112,29 @@ color_tmux() {
 	esac
 }
 
+# Print $1 as literal text in the status line.  tmux treats "#" as the start
+# of a format -- #(command), #{variable}, #[style] -- and re-expands the output
+# of the #(byobu-status) job that produces the whole status line, so a "#"
+# that arrived as data (a hostname, /etc/os-release, an SSID) would be
+# interpreted rather than shown, and could name tmux variables to display or
+# restyle the bar.  Doubling it makes it literal.  screen prints "#" as is.
+printf_status() {
+	local s="$1" head=
+	case "$BYOBU_BACKEND" in
+		tmux)
+			while [ -n "$s" ]; do
+				head="${s%%#*}"
+				printf "%s" "$head"
+				s="${s#"$head"}"
+				[ -n "$s" ] && printf "##" && s="${s#\#}"
+			done
+		;;
+		*)
+			printf "%s" "$s"
+		;;
+	esac
+}
+
 color() {
 	case "$BYOBU_BACKEND" in
 		tmux)

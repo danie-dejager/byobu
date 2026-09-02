@@ -28,6 +28,17 @@ mkdir -p "$DIR"
 PRESETS="even-horizontal even-vertical main-horizontal main-vertical tiled"
 current_panes=$(tmux list-panes | wc -l)
 
+# A layout name is a file name inside $DIR and nothing more: no path
+# separators, no leading dot, nothing a shell or tmux would interpret.  Names
+# arrive from the command line, from the tmux paste buffer (C-S-F8), and from
+# stdin, so every source gets the same check.
+valid_name() {
+	case "$1" in
+		""|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
 list_layouts() {
 	echo
 	echo "Byobu Saved Layouts"
@@ -68,7 +79,11 @@ case "$1" in
 				[ "$valid" = "1" ] && break
 			done
 		fi
-		printf "$panes\n$layout\n" > "$BYOBU_CONFIG_DIR/layouts/$name"
+		if ! valid_name "$name"; then
+			echo "ERROR: invalid layout name: '$name' (letters, digits, '.', '_', '-' only)" >&2
+			exit 1
+		fi
+		printf '%s\n%s\n' "$panes" "$layout" > "$DIR/$name"
 	;;
 	"restore")
 		if [ -n "$2" ]; then
@@ -81,7 +96,8 @@ case "$1" in
 			while true; do
 				echo -n "Select a layout to restore [1-$count]: "
 				selected=$(head -n1)
-				if [ -n "$selected" ] && [ $selected -le $count ] && [ $selected -ge 1 ]; then
+				case "$selected" in ""|*[!0-9]*) continue ;; esac
+				if [ "$selected" -le "$count" ] && [ "$selected" -ge 1 ]; then
 					break
 				fi
 			done
@@ -97,6 +113,10 @@ case "$1" in
 		# Get the details of the selected layout
 		panes=
 		layout=
+		if ! valid_name "$name"; then
+			echo "ERROR: invalid layout name: '$name'" >&2
+			exit 1
+		fi
 		if [ -f "$DIR/$name" ]; then
 			panes=$(head -n1 "$DIR/$name")
 			layout=$(tail -n1 "$DIR/$name")

@@ -31,7 +31,9 @@ if [ "$1" = "--undo" ]; then
 else
 	touch "$FLAG"
 	# BUG: Need to make this dynamic and following
-	status="$USER@$(hostname)"
+	# Written inside quotes into a screenrc: keep it to characters that
+	# cannot end the quote or start a screen command
+	status=$(printf '%s' "$USER@$(hostname)" | tr -cd 'A-Za-z0-9.@_-')
 	echo "hardstatus lastline '$status'" >> "$BYOBU_CONFIG_DIR/keybindings"
 fi
 $BYOBU_BACKEND -X at 0 source "$BYOBU_CONFIG_DIR/profile"

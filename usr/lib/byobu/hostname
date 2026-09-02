@@ -40,7 +40,7 @@ __hostname() {
 		[ -s "$cache" ] && read h < "$cache"
 	fi
 	[ -n "$h" ] || return
-	color bold2; printf "%s" "$h"; color --
+	color bold2; printf_status "$h"; color --
 }
 
 # vi: syntax=sh ts=4 noexpandtab

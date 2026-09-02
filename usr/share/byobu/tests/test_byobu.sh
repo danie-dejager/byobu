@@ -1209,6 +1209,67 @@ assert_false "tmpfsffs: no 'mv /tmp/*' glob" "grep -q 'mv /tmp/\*' '$_tff'"
 assert_true  "tmpfsffs: uses find -exec mv -t ... --" "grep -q 'find /tmp -mindepth 1 -maxdepth 1 -exec mv -t .* -- {} +' '$_tff'"
 unset _tff
 
+# printf_status: "#" from data must reach tmux doubled, screen untouched
+out=$(BYOBU_BACKEND=tmux printf_status 'host#(id)#{pane_current_path}#[fg=red]x')
+assert_eq "printf_status tmux: every # doubled" "$out" 'host##(id)##{pane_current_path}##[fg=red]x'
+out=$(BYOBU_BACKEND=tmux printf_status '###')
+assert_eq "printf_status tmux: run of #" "$out" '######'
+out=$(BYOBU_BACKEND=tmux printf_status 'plain')
+assert_eq "printf_status tmux: no # is a no-op" "$out" 'plain'
+out=$(BYOBU_BACKEND=screen printf_status 'a#b')
+assert_eq "printf_status screen: literal" "$out" 'a#b'
+for _f in hostname release distro whoami; do
+	assert_true "status/$_f: emits via printf_status" \
+		"grep -q 'printf_status' '${BYOBU_PREFIX}/lib/${PKG}/$_f'"
+done
+unset _f
+
+# byobu-ulevel: option values are numbers or nothing (they reach bc and eval).
+# Section 17's temp copy is gone by now; run the .in directly (with
+# BYOBU_INCLUDED_LIBS=1 it never reaches the @prefix@ include).
+_ul() { BYOBU_INCLUDED_LIBS=1 BYOBU_BACKEND=tmux PKG=byobu bash "${BYOBU_PREFIX}/bin/byobu-ulevel.in" "$@"; }
+assert_true "ulevel: numeric -c accepted" "_ul -c 50 >/dev/null 2>&1"
+assert_false "ulevel: -c with bc code is refused" "_ul -c 'x; print 1' >/dev/null 2>&1"
+assert_false "ulevel: -m with shell text is refused" "_ul -c 5 -m '\$(id)' >/dev/null 2>&1"
+assert_false "ulevel: -x non-numeric is refused" "_ul -c 5 -x 10abc >/dev/null 2>&1"
+assert_false "ulevel: -w non-numeric is refused" "_ul -c 5 -w '3 3' >/dev/null 2>&1"
+out=$(_ul -c 5 -m -10 -x 10.5 -w 4 2>/dev/null)
+assert_nonempty "ulevel: negative and decimal bounds still accepted" "$out"
+out=$(_ul -c 50 -u 'a b c' 2>/dev/null)
+assert_nonempty "ulevel: user theme via -u still renders" "$out"
+_ul_tmp=$(mktemp -d)
+_ul -c 50 -u 'a $(touch '"$_ul_tmp"'/pwned) c' >/dev/null 2>&1 || true
+assert_false "ulevel: user theme glyphs are not eval'd" "[ -e '$_ul_tmp/pwned' ]"
+rm -rf "$_ul_tmp"; unset _ul_tmp
+assert_false "ulevel: theme name is matched exactly, not as a regex" "_ul -c 5 -t 'vbars_[8]' >/dev/null 2>&1"
+
+# col1: column number comes from argv[0] and is data to awk, not program text
+_col_tmp=$(mktemp -d)
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_col_tmp/col3"
+_col_evil='col1);system("touch pwned");{print(1'
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_col_tmp/$_col_evil"
+out=$(printf 'a b c d\n' | "$_col_tmp/col3")
+assert_eq "col3: prints third column" "$out" "c"
+out=$(printf 'a:b:c\n' | "$_col_tmp/col3" :)
+assert_eq "col3 with separator" "$out" "c"
+assert_true "colN: hostile argv[0] is a usage error" "[ -L '$_col_tmp/$_col_evil' ] && ! (cd '$_col_tmp' && printf 'a b\n' | ./\"\$_col_evil\" >/dev/null 2>&1)"
+(cd "$_col_tmp" && printf 'a b\n' | "./$_col_evil" >/dev/null 2>&1) || true
+assert_false "colN: hostile argv[0] does not reach awk program text" "[ -e '$_col_tmp/pwned' ]"
+unset _col_evil
+rm -rf "$_col_tmp"; unset _col_tmp
+
+# Static checks on scripts that need a live tmux or network to run
+assert_false "byobu-ugraph: no predictable /tmp file" "grep -q 'file=/tmp/\${USER}' '${BYOBU_PREFIX}/bin/byobu-ugraph.in'"
+assert_false "byobu-ugraph: no eval of the command" "grep -q 'eval \"\$cmd' '${BYOBU_PREFIX}/bin/byobu-ugraph.in'"
+assert_true  "byobu-layout: validates layout names" "grep -q 'valid_name \"\$name\"' '${BYOBU_PREFIX}/bin/byobu-layout.in'"
+assert_false "byobu-layout: no printf with data as format" "grep -q 'printf \"\$panes' '${BYOBU_PREFIX}/bin/byobu-layout.in'"
+assert_true  "wifi-status: validates interface name" "grep -q 'invalid wireless interface name' '${BYOBU_PREFIX}/bin/wifi-status'"
+assert_true  "wifi-status: validates ping target" "grep -q 'invalid WIFI_PING_TARGET' '${BYOBU_PREFIX}/bin/wifi-status'"
+assert_true  "whats-my-public-ip: https only" "! grep -q 'http://' '${BYOBU_PREFIX}/bin/whats-my-public-ip'"
+assert_true  "purge-old-kernels: quotes \$@" "grep -q 'apt-get \"\$@\" autoremove' '${BYOBU_PREFIX}/bin/purge-old-kernels'"
+assert_false "byobu-ctrl-a: stray character after keybindings path removed" "grep -q '\"\$keybindings\"e' '${BYOBU_PREFIX}/bin/byobu-ctrl-a.in'"
+assert_false "updates_available: cache path not spliced into sh -c" "grep -q 'sh -c \".*mycache' '${BYOBU_PREFIX}/lib/${PKG}/updates_available'"
+
 # ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------

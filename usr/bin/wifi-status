@@ -33,6 +33,26 @@ router=$(ip route show|head -n 1|awk '{print $3}')
 [ -r "$HOME/.byobu/statusrc" ] && . "$HOME/.byobu/statusrc" 2>/dev/null || true
 WIFI_PING_TARGET="${WIFI_PING_TARGET:-8.8.8.8}"
 
+# Everything below is pasted into shell command strings for watch(1) and
+# tmux, so each value must be a single plain word: an interface name, and
+# an address or hostname.  A statusrc synced from elsewhere, or a stray
+# argument, must not be able to smuggle "; command" through.
+case "$dev" in
+	""|*[!A-Za-z0-9._-]*)
+		echo "ERROR: invalid wireless interface name: '$dev'" >&2
+		exit 1
+	;;
+esac
+case "$WIFI_PING_TARGET" in
+	""|*[!A-Za-z0-9.:_-]*)
+		echo "ERROR: invalid WIFI_PING_TARGET: '$WIFI_PING_TARGET'" >&2
+		exit 1
+	;;
+esac
+case "$router" in
+	*[!A-Za-z0-9.:]*) router="$WIFI_PING_TARGET" ;;
+esac
+
 if [ -z "$TMUX" ]; then
 	watch -n1 "iw $dev info; ip addr show $dev; ip route; echo; (journalctl -b --no-pager -q | grep -i $dev | tail -n 10 | sort -r); echo; ping -I $dev -c 1 $WIFI_PING_TARGET"
 else
