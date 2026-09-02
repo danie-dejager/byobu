@@ -18,6 +18,18 @@ lost, just relocated to where all distributions can use it.
 
 byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
 
+  * mobile: security: raise the tornado floor to 6.5.8, closing three
+    Dependabot advisories: GHSA-mpf4-983q-p7j4 (high -- urlencoded body
+    parsing omits max_num_fields, can stall the event loop),
+    GHSA-8423-8fgw-73vq (medium -- multipart parsing builds an unbounded
+    temp list before checking max_parts, memory-amplification DoS), and
+    GHSA-wwv5-g3v4-889x (low -- incomplete fix for an earlier cookie-
+    attribute-injection CVE). mobile/uv.lock and mobile/requirements.txt
+    regenerated to match; homebrew/Formula/trustmux.rb's separately
+    pinned tornado resource updated too, since it drifts independently
+    of pyproject.toml/uv.lock and Dependabot doesn't parse Ruby resource
+    blocks (the exact class of gap release.py's
+    check_homebrew_resources_fresh() exists to catch)
   * usr/bin/tmpfsffs: removed. Never actually shipped in any package
     (missing from dist_bin_SCRIPTS since it was added) and was always a
     proof-of-concept, not a real part of byobu -- rather than fix its
