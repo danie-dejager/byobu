@@ -82,18 +82,6 @@ function _subscribeSettled() {
 let _currentPaneRawLines = [];
 let _currentPaneRawLinesFor = null;
 
-// How many of a pane's _currentPaneRawLines have already been read aloud
-// (speakNewOutput() below reads from this cursor to the end, then advances
-// it). Reset to "fully read" on every 'snapshot' or 'update' -- both mean
-// the captured window was replaced wholesale rather than incrementally
-// appended, so old index positions don't correspond to the same lines
-// anymore; treating a full replacement as "nothing new to read" avoids
-// re-narrating content already visible on screen (e.g. right after
-// switching to a pane) rather than genuinely new since last read. Only
-// 'delta' messages are true appends, so only they leave this cursor alone
-// for speakNewOutput() to catch up on later.
-const _spokenLineCounts = new Map();
-
 // ── offline / connectivity helpers ────────────────────────────────────────
 let _serverVersion = null;
 
@@ -433,7 +421,6 @@ function connect() {
       if (msg.pane_id === currentPane) {
         _currentPaneRawLines = msg.data.split('\n');
         _currentPaneRawLinesFor = msg.pane_id;
-        _spokenLineCounts.set(msg.pane_id, _currentPaneRawLines.length);
         const forceTop = _scrollTopOnNextSnapshot;
         if (forceTop) _scrollTopOnNextSnapshot = false;
         const atBottom = output.scrollHeight - output.scrollTop <= output.clientHeight + 60;
@@ -444,7 +431,6 @@ function connect() {
       if (msg.pane_id !== currentPane) return;
       _currentPaneRawLines = msg.data.split('\n');
       _currentPaneRawLinesFor = msg.pane_id;
-      _spokenLineCounts.set(msg.pane_id, _currentPaneRawLines.length);
       const atBottom = output.scrollHeight - output.scrollTop <= output.clientHeight + 60;
       renderOutput(msg.data, atBottom);
     } else if (msg.type === 'delta') {
@@ -1026,54 +1012,6 @@ escapePopupWrap.addEventListener('click', () => {
   }
   applyWrap();
   scrollOutputToBottom();
-  hideEscapePopup();
-});
-
-// ── voice output (text-to-speech) ───────────────────────────────────────────
-// Manual trigger, not automatic narration -- deliberately, not just for
-// simplicity: there's no reliable "this pane has settled" signal to
-// automate around, and a human choosing to read pane content aloud after
-// glancing at it is a real safety property an always-on narrator in a room
-// with other people is not -- on-screen output can contain a secret
-// regardless of what's currently focused for typing.
-//
-// speechSynthesis is on-device on both Android and iOS -- no equivalent of
-// the "audio leaves the device" concern that applies to speech-to-text, so
-// nothing here needs consent/disclosure the way voice input would.
-//
-// Strips ANSI/OSC escapes entirely rather than converting them like
-// ansiToHtml does -- spoken output has no equivalent to color/bold, so
-// there's nothing to preserve.
-function _stripAnsiForSpeech(text) {
-  return text.replace(/\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|.)/g, '');
-}
-
-const _MAX_SPEECH_LINES = 40;
-
-function speakNewOutput() {
-  if (!currentPane || _currentPaneRawLinesFor !== currentPane) return;
-  const already = _spokenLineCounts.get(currentPane) || 0;
-  _spokenLineCounts.set(currentPane, _currentPaneRawLines.length);
-  const lines = _currentPaneRawLines
-    .slice(already)
-    .map(_stripAnsiForSpeech)
-    .map(l => l.trim())
-    // Decorative separators (rules, blank padding) aren't worth speaking.
-    .filter(l => l && !/^[-=_#*~ ]+$/.test(l));
-  if (!lines.length) return;
-  let toSpeak = lines, prefix = '';
-  if (lines.length > _MAX_SPEECH_LINES) {
-    // Keep the tail (most recent), not the head: a big burst of new output
-    // is more useful narrated from "what just happened" than from wherever
-    // the burst started.
-    toSpeak = lines.slice(-_MAX_SPEECH_LINES);
-    prefix = `Skipping ${lines.length - _MAX_SPEECH_LINES} earlier lines. `;
-  }
-  speechSynthesis.speak(new SpeechSynthesisUtterance(prefix + toSpeak.join('. ')));
-}
-
-document.getElementById('escape-popup-speak').addEventListener('click', () => {
-  speakNewOutput();
   hideEscapePopup();
 });
 

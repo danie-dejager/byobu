@@ -18,16 +18,6 @@ lost, just relocated to where all distributions can use it.
 
 byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
 
-  * trustmux/pwa: add a "Read new output" action to the escape popup --
-    speaks pane content aloud via on-device text-to-speech, narrating
-    only what's changed since the last read (or since switching to the
-    pane) and skipping ANSI colors and decorative separator lines.
-    Manual trigger, not automatic narration: on-screen output can
-    contain a secret regardless of what's focused for typing, so a
-    human choosing to read something aloud after glancing at it is a
-    safety property worth keeping. Voice input deliberately not
-    included -- Android's own keyboard already has voice-to-text built
-    in
   * usr/bin/tmpfsffs: removed. Never actually shipped in any package
     (missing from dist_bin_SCRIPTS since it was added) and was always a
     proof-of-concept, not a real part of byobu -- rather than fix its
