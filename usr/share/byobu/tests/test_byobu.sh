@@ -1225,9 +1225,22 @@ done
 unset _f
 
 # byobu-ulevel: option values are numbers or nothing (they reach bc and eval).
-# Section 17's temp copy is gone by now; run the .in directly (with
-# BYOBU_INCLUDED_LIBS=1 it never reaches the @prefix@ include).
-_ul() { BYOBU_INCLUDED_LIBS=1 BYOBU_BACKEND=tmux PKG=byobu bash "${BYOBU_PREFIX}/bin/byobu-ulevel.in" "$@"; }
+# Section 17's temp copy is gone by now (rm'd once its own tests finished) --
+# build a fresh one the same way it did: @prefix@-substituted .in from the
+# source tree, or the real installed binary when .in isn't shipped (an
+# installed package never ships .in templates, only their substituted
+# output). Getting this wrong doesn't just fail the assert_true checks
+# below -- the assert_false ones (hostile input must be *rejected*) would
+# silently pass for the wrong reason too, since "no such file" is also a
+# nonzero exit, masking whether the actual validation logic ever ran.
+_ul_bin=$(mktemp /tmp/byobu-ulevel-test-42-XXXXXX)
+sed "s|@prefix@|${BYOBU_PREFIX}|g" \
+	"${BYOBU_PREFIX}/../usr/bin/byobu-ulevel.in" > "$_ul_bin" 2>/dev/null || \
+sed "s|@prefix@|${BYOBU_PREFIX}|g" \
+	"$(dirname "$0")/../../bin/byobu-ulevel.in" > "$_ul_bin" 2>/dev/null || \
+cp "${BYOBU_PREFIX}/bin/byobu-ulevel" "$_ul_bin" 2>/dev/null || true
+chmod +x "$_ul_bin"
+_ul() { BYOBU_INCLUDED_LIBS=1 BYOBU_BACKEND=tmux PKG=byobu bash "$_ul_bin" "$@"; }
 assert_true "ulevel: numeric -c accepted" "_ul -c 50 >/dev/null 2>&1"
 assert_false "ulevel: -c with bc code is refused" "_ul -c 'x; print 1' >/dev/null 2>&1"
 assert_false "ulevel: -m with shell text is refused" "_ul -c 5 -m '\$(id)' >/dev/null 2>&1"
@@ -1242,6 +1255,7 @@ _ul -c 50 -u 'a $(touch '"$_ul_tmp"'/pwned) c' >/dev/null 2>&1 || true
 assert_false "ulevel: user theme glyphs are not eval'd" "[ -e '$_ul_tmp/pwned' ]"
 rm -rf "$_ul_tmp"; unset _ul_tmp
 assert_false "ulevel: theme name is matched exactly, not as a regex" "_ul -c 5 -t 'vbars_[8]' >/dev/null 2>&1"
+rm -f "$_ul_bin"; unset _ul_bin
 
 # col1: column number comes from argv[0] and is data to awk, not program text
 _col_tmp=$(mktemp -d)
@@ -1258,11 +1272,29 @@ assert_false "colN: hostile argv[0] does not reach awk program text" "[ -e '$_co
 unset _col_evil
 rm -rf "$_col_tmp"; unset _col_tmp
 
-# Static checks on scripts that need a live tmux or network to run
-assert_false "byobu-ugraph: no predictable /tmp file" "grep -q 'file=/tmp/\${USER}' '${BYOBU_PREFIX}/bin/byobu-ugraph.in'"
-assert_false "byobu-ugraph: no eval of the command" "grep -q 'eval \"\$cmd' '${BYOBU_PREFIX}/bin/byobu-ugraph.in'"
-assert_true  "byobu-layout: validates layout names" "grep -q 'valid_name \"\$name\"' '${BYOBU_PREFIX}/bin/byobu-layout.in'"
-assert_false "byobu-layout: no printf with data as format" "grep -q 'printf \"\$panes' '${BYOBU_PREFIX}/bin/byobu-layout.in'"
+# Static checks on scripts that need a live tmux or network to run.
+# byobu-ugraph/byobu-layout are .in templates -- absent by design from an
+# installed package (only their @prefix@-substituted output ships), so
+# check that instead when .in isn't found. This isn't just cosmetic for
+# the assert_true below: the assert_false checks would otherwise "pass"
+# against a missing file for the wrong reason (no match is also true of
+# no file), silently verifying nothing in that environment.
+_resolve_or_installed() {
+	# $1: script base name (no .in). Echoes whichever exists.
+	if [ -r "${BYOBU_PREFIX}/bin/$1.in" ]; then
+		printf '%s' "${BYOBU_PREFIX}/bin/$1.in"
+	else
+		printf '%s' "${BYOBU_PREFIX}/bin/$1"
+	fi
+}
+_ugraph=$(_resolve_or_installed byobu-ugraph)
+_layout=$(_resolve_or_installed byobu-layout)
+assert_false "byobu-ugraph: no predictable /tmp file" "grep -q 'file=/tmp/\${USER}' '$_ugraph'"
+assert_false "byobu-ugraph: no eval of the command" "grep -q 'eval \"\$cmd' '$_ugraph'"
+assert_true  "byobu-layout: validates layout names" "grep -q 'valid_name \"\$name\"' '$_layout'"
+assert_false "byobu-layout: no printf with data as format" "grep -q 'printf \"\$panes' '$_layout'"
+unset -f _resolve_or_installed
+unset _ugraph _layout
 assert_true  "wifi-status: validates interface name" "grep -q 'invalid wireless interface name' '${BYOBU_PREFIX}/bin/wifi-status'"
 assert_true  "wifi-status: validates ping target" "grep -q 'invalid WIFI_PING_TARGET' '${BYOBU_PREFIX}/bin/wifi-status'"
 assert_true  "whats-my-public-ip: https only" "! grep -q 'http://' '${BYOBU_PREFIX}/bin/whats-my-public-ip'"

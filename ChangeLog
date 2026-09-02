@@ -28,6 +28,21 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     safety property worth keeping. Voice input deliberately not
     included -- Android's own keyboard already has voice-to-text built
     in
+  * usr/bin/Makefile.am: install tmpfsffs -- it has been missing from
+    dist_bin_SCRIPTS since it was added, so it never actually shipped in
+    any package; the 2026-09 security audit's new install-location test
+    was the first thing to actually notice
+  * usr/share/byobu/tests/test_byobu.sh: fix Section 42's ulevel/ugraph/
+    layout checks to fall back to the installed script when the .in
+    source template isn't present (an installed package never ships
+    .in files, only their substituted output). These hardcoded the .in
+    path directly, so every one of them was silently exercising nothing
+    against an installed package -- a missing file satisfies "no such
+    pattern found" just as well as an absent pattern does, so the
+    assert_false checks "passed" for the wrong reason and the assert_true
+    ones failed outright. Verified against a real dpkg-buildpackage
+    build + install (not just source-tree): 225 passing, was 220 passed
+    / 5 failed
   * security: fixes from the 2026-09 security audit (CVE requests pending
     for the first four)
     - manifest: validate package names and pass "--" before them; a
