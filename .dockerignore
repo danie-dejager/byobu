@@ -1,0 +1,7 @@
+.git
+.venv
+mobile/.venv
+mobile/dist
+mobile/build
+mobile/*.egg-info
+**/__pycache__

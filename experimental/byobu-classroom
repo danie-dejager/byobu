@@ -20,9 +20,20 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
+# WARNING: this configures a *shared classroom machine*.  It creates a
+# password-only guest account, makes screen(1) setuid root (for screen -x
+# multi-user mode), and edits /etc/ssh/sshd_config.  Run it only on a host
+# you intend to open up this way, and undo it afterwards with the commands it
+# prints.  It is experimental and is not installed by the byobu packages.
+
 PKG="byobu"
 
 . "/usr/lib/$PKG/include/shutil"
+
+if [ "$(id -u)" != "0" ]; then
+	echo "ERROR: $0 must be run as root" >&2
+	exit 1
+fi
 
 usage() {
 	echo
@@ -35,6 +46,15 @@ usage() {
 
 [ -n "${1}" ] && HOSTUSER="${1}" || HOSTUSER="$SUDO_USER"
 [ -n "${2}" ] && GUESTUSER="${2}" || GUESTUSER="guest"
+# Both names are written into sshd_config and handed to useradd and su
+for u in "$HOSTUSER" "$GUESTUSER"; do
+	case "$u" in
+		""|*[!a-z0-9_-]*|-*)
+			echo "ERROR: invalid user name: '$u'" >&2
+			exit 1
+		;;
+	esac
+done
 
 # Ensure that our host user exists
 while ! id "$HOSTUSER" >/dev/null 2>&1; do
@@ -73,8 +93,11 @@ while ! id "$GUESTUSER" >/dev/null 2>&1; do
 	c=$(head -n1)
 	case "$c" in
 		y|Y)
-			# Hardcode password to "guest"
-			cryptpw="ubXWbZ4Ffn.mg"
+			# A fresh random password every time: a fixed, well-known one
+			# on an SSH host with password auth is an open door.  It is
+			# printed once at the end of setup for the teacher to share.
+			GUESTPASS=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
+			cryptpw=$(printf '%s' "$GUESTPASS" | openssl passwd -6 -stdin)
 			useradd -m -s /bin/bash -p "$cryptpw" "$GUESTUSER"
 			touch "/home/$GUESTUSER/.screenrc"
 			chown -R root:root /home/$GUESTUSER
@@ -126,10 +149,13 @@ while [ $(grep -c "#byobu-classrom" /etc/ssh/sshd_config) != "4" ]; do
 	case "$c" in
 		y|Y)
 			$BYOBU_SED_INLINE -e '/#byobu-classroom/d' /etc/ssh/sshd_config || true
+			# Everything goes inside the Match block: a bare
+			# "PasswordAuthentication yes" would re-enable passwords for
+			# every account on the host, not just the guest.
 			echo "
-PasswordAuthentication yes				#byobu-classroom
-AllowTcpForwarding no					#byobu-classroom
 Match User $GUESTUSER					#byobu-classroom
+  PasswordAuthentication yes				#byobu-classroom
+  AllowTcpForwarding no					#byobu-classroom
   ForceCommand exec screen -x $HOSTUSER/byobu-classroom	#byobu-classroom
 " >> /etc/ssh/sshd_config
 			echo
@@ -145,13 +171,17 @@ service ssh restart
 
 
 # Launch the session detached
-su -l $HOSTUSER -c 'byobu -c /usr/share/byobu/profiles/classroom -d -m -S byobu-classroom -t shell bash'
+su -l "$HOSTUSER" -c 'byobu -c /usr/share/byobu/profiles/classroom -d -m -S byobu-classroom -t shell bash'
 
 info "Byobu classroom setup successfully!"
 echo
 info "Please tell your guests to:"
 info "  ssh -C $GUESTUSER@$(hostname)"
-info "with password=guest"
+if [ -n "$GUESTPASS" ]; then
+	info "with password: $GUESTPASS"
+else
+	info "with the [$GUESTUSER] password you set previously"
+fi
 echo
 info "As the host, you should connect with:"
 info "  ssh -C $HOSTUSER@$(hostname)"

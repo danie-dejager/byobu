@@ -243,17 +243,23 @@ def die(msg):
     sys.exit(1)
 
 
-def confirm(prompt, skippable=False):
+def confirm(prompt, skippable=False, always=False):
     """Prompt the user to proceed, skip, or abort.
 
-    In non-interactive mode (default) auto-proceeds without prompting.
+    In non-interactive mode (default) auto-proceeds without prompting,
+    unless always=True: that is for the one step that puts the maintainer's
+    signature on artifacts and publishes them, which must never happen
+    without a human reading what is about to be signed.
     Returns True  — user chose to proceed (y/yes), or auto-proceed.
     Returns False — user chose to skip this step (s/skip); only when skippable=True.
     Calls die()   — user chose to abort (anything else).
     """
-    if not _interactive:
+    if not _interactive and not always:
         print(f"\n  (auto-proceeding: {prompt[:60]}{'…' if len(prompt) > 60 else ''})")
         return True
+    if always and not sys.stdin.isatty():
+        die("This step needs an explicit yes from a terminal and stdin is not one.\n"
+            "  Re-run from an interactive shell (or with -i).")
     opts = "[y/s/N]" if skippable else "[y/N]"
     ans = input(f"\n{prompt} {opts} ").strip().lower()
     if ans in ("y", "yes"):
@@ -499,20 +505,55 @@ def prewarm_gpg(identity):
         sig.unlink(missing_ok=True)
 
 
+# Everything the pipeline writes and later reads back -- build output, clones,
+# tarballs -- lives under here rather than /tmp.  /tmp is shared, and a
+# predictable name there (/tmp/byobu-release-7.19, /tmp/homebrew-trustmux)
+# can be created first by any other local user: a planted .deb would then be
+# what "sudo dpkg -i" installs, a planted .git/config would run their hooks
+# under the maintainer's account.  A directory under $HOME that we create
+# 0700 has neither problem.
+RELEASE_CACHE = Path.home() / ".cache" / "byobu-release"
+
+
+def private_dir(path: Path) -> Path:
+    """Create path 0700 if missing; refuse it if it is not ours or is loose."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = path.stat()
+    if st.st_uid != os.getuid():
+        die(f"{path} is owned by uid {st.st_uid}, not by you — refusing to use it.")
+    if st.st_mode & 0o077:
+        die(f"{path} is mode {st.st_mode & 0o777:04o}; it must be 0700 "
+            f"(chmod 700 {path}) — its contents get installed as root and signed.")
+    if path.is_symlink():
+        die(f"{path} is a symlink — refusing to use it.")
+    return path
+
+
 def find_tap(name, mode):
     """Locate or clone a dustinkirkland/homebrew-{name} tap. Returns None for rc."""
     if mode == "rc":
         return None
+    expected = f"dustinkirkland/homebrew-{name}"
     for d in [
-        Path(f"/tmp/homebrew-{name}"),
         Path.home() / f"src/homebrew-{name}",
         Path.home() / f"homebrew-{name}",
+        RELEASE_CACHE / f"homebrew-{name}",
     ]:
-        if (d / ".git").is_dir():
-            print(f"  Homebrew tap ({name}): {d}")
-            return d
-    tap = Path(f"/tmp/homebrew-{name}")
-    run(["git", "clone", f"git@github.com:dustinkirkland/homebrew-{name}.git", str(tap)])
+        if not (d / ".git").is_dir():
+            continue
+        # git pull/commit/push run whatever this checkout's config and hooks
+        # say, and push to wherever "origin" points: make sure it is ours and
+        # really is the tap before touching it.
+        if d.stat().st_uid != os.getuid():
+            die(f"{d} is not owned by you — refusing to use it as the {name} tap.")
+        origin = run(["git", "-C", str(d), "remote", "get-url", "origin"],
+                     capture=True, check=False).stdout.strip()
+        if expected not in origin:
+            die(f"{d} has origin {origin!r}, not {expected} — refusing to use it.")
+        print(f"  Homebrew tap ({name}): {d}")
+        return d
+    tap = private_dir(RELEASE_CACHE) / f"homebrew-{name}"
+    run(["git", "clone", f"git@github.com:{expected}.git", str(tap)])
     return tap
 
 
@@ -561,7 +602,7 @@ def determine_versions(mode, resume=False):
         if resume:
             # Phase 3 (push_pypi_tag) already pushed the tag for the run being
             # resumed, so "next after highest" would skip ahead to a new RC
-            # number whose /tmp/byobu-release-* dir was never built. Reuse the
+            # number whose byobu-release-* dir was never built. Reuse the
             # highest existing tag instead of incrementing past it.
             if not existing:
                 die(
@@ -631,7 +672,7 @@ def determine_versions(mode, resume=False):
         d = json.loads(
             urllib.request.urlopen(
                 "https://api.launchpad.net/1.0/ubuntu/series"
-            ).read()
+            , timeout=30).read()
         )
         active = {"Active Development", "Current Stable Release", "Supported"}
         series = [
@@ -660,7 +701,7 @@ def determine_versions(mode, resume=False):
             )
             all_entries = []
             for status in ("Published", "Pending"):
-                d = json.loads(urllib.request.urlopen(base_url + status).read())
+                d = json.loads(urllib.request.urlopen(base_url + status, timeout=30).read())
                 all_entries += d.get("entries", [])
 
             def dpkg_ge(v1, v2):
@@ -697,14 +738,16 @@ def determine_versions(mode, resume=False):
         except urllib.error.URLError as e:
             print(f"  (Launchpad check skipped — network error: {e})")
 
-    # Output directory
-    outdir = Path(f"/tmp/byobu-release-{ppa_base}")
+    # Output directory: private to us (see RELEASE_CACHE), never /tmp.
+    outdir = private_dir(RELEASE_CACHE) / f"byobu-release-{ppa_base}"
     if resume:
         if not outdir.exists():
             die(
                 f"--start-from: output directory {outdir} not found.\n"
                 f"  Run without --start-from first to create it."
             )
+        # Whatever is in here is about to be signed and offered to dpkg -i.
+        private_dir(outdir)
         # Ensure all subdirs exist (harmless if already there)
         (outdir / "debs").mkdir(exist_ok=True)
         (outdir / "debian").mkdir(exist_ok=True)
@@ -718,7 +761,8 @@ def determine_versions(mode, resume=False):
     else:
         if outdir.exists():
             shutil.rmtree(outdir)
-        (outdir / "debs").mkdir(parents=True)
+        outdir.mkdir(mode=0o700, parents=True)
+        (outdir / "debs").mkdir()
         (outdir / "debian").mkdir()
         (outdir / "rpm").mkdir()
         (outdir / "logs").mkdir()
@@ -917,14 +961,12 @@ def _build_local_sdist(v):
     mobile = BYOBU_SRC / "mobile"
     # Copy source to a writable scratch dir — previous Docker runs may have
     # left root-owned trustmux.egg-info and dist/ files inside mobile/.
-    src_copy = Path("/tmp/trustmux-sdist-src")
-    if src_copy.exists():
-        shutil.rmtree(src_copy)
+    import tempfile
+    scratch = Path(tempfile.mkdtemp(prefix="trustmux-sdist-"))
+    src_copy = scratch / "src"
     shutil.copytree(mobile, src_copy, ignore=shutil.ignore_patterns(".venv", "__pycache__"))
-    dist = Path("/tmp/trustmux-sdist-build")
-    if dist.exists():
-        shutil.rmtree(dist)
-    dist.mkdir(parents=True)
+    dist = scratch / "dist"
+    dist.mkdir()
     # Prefer `uv build` (no separate install required); fall back to
     # `python3 -m build` if uv is not on PATH.
     uv = shutil.which("uv")
@@ -1500,7 +1542,7 @@ def update_homebrew(v, tap_dir):
     for attempt in range(20):
         try:
             url = f"https://pypi.org/pypi/trustmux/{v['pypi_version']}/json"
-            d = json.loads(urllib.request.urlopen(url).read())
+            d = json.loads(urllib.request.urlopen(url, timeout=30).read())
             for u in d["urls"]:
                 if u["filename"].endswith(".tar.gz"):
                     tarball_url = u["url"]
@@ -1579,7 +1621,7 @@ def update_homebrew_byobu(v, tap_dir):
     tarball_data = None
     for attempt in range(20):
         try:
-            tarball_data = urllib.request.urlopen(tarball_url).read()
+            tarball_data = urllib.request.urlopen(tarball_url, timeout=30).read()
             break
         except urllib.error.URLError:
             pass
@@ -1682,6 +1724,11 @@ def _build_release_notes(v):
         subject = parts[1]
         if subject.startswith("bump version to "):
             continue
+        # Contributor-authored text on a public release page: strip control
+        # characters and neutralise markdown so a subject cannot smuggle in
+        # links or formatting.
+        subject = re.sub(r"[\x00-\x1f\x7f]", "", subject)
+        subject = re.sub(r"([\\`*_\[\]<>~|])", r"\\\1", subject)
         subjects.append(subject)
 
     if not subjects:
@@ -1764,14 +1811,67 @@ def create_github_release(v, mode):
 
 # ── sign and upload ───────────────────────────────────────────────────────
 
-def sign_and_upload(v, identity, mode):
+def _sha256_stream(cmd, cwd=None):
+    import hashlib
+    h = hashlib.sha256()
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, cwd=cwd) as p:
+        for chunk in iter(lambda: p.stdout.read(1 << 20), b""):
+            h.update(chunk)
+    if p.returncode != 0:
+        die(f"{cmd[0]} failed while hashing")
+    return h.hexdigest()
+
+
+def verify_orig_tarballs(outdir, subdirs, pkg):
+    """The source packages were produced inside containers pulled by mutable
+    tag; before the maintainer's key goes on them, check that each
+    .orig.tar.gz really is `git archive HEAD` of this checkout (same tar
+    stream once decompressed), and that the .dsc names that exact file."""
+    import hashlib
+    checked = 0
+    for subdir in subdirs:
+        for orig in sorted((outdir / subdir).glob(f"{pkg}_*.orig.tar.gz")):
+            upver = orig.name[len(pkg) + 1:-len(".orig.tar.gz")]
+            want = _sha256_stream(["git", "-C", str(BYOBU_SRC), "archive",
+                                   "--format=tar", f"--prefix={pkg}-{upver}/", "HEAD"])
+            got = _sha256_stream(["gzip", "-dc", str(orig)])
+            if want != got:
+                die(f"{orig} does not match `git archive HEAD` of {BYOBU_SRC}.\n"
+                    f"  The build container produced source that is not this tree.\n"
+                    f"  Do not sign it. (--no-verify-orig skips this check.)")
+            gz_sha = hashlib.sha256(orig.read_bytes()).hexdigest()
+            for dsc in sorted((outdir / subdir).glob(f"{pkg}_{upver}-*.dsc")):
+                text = dsc.read_text()
+                if f"{gz_sha} {orig.stat().st_size} {orig.name}" not in text:
+                    die(f"{dsc.name} does not list {orig.name} with its actual "
+                        f"sha256 — refusing to sign.")
+            checked += 1
+            print(f"  ✓ {orig.name} is git archive HEAD; .dsc checksums agree")
+    if not checked:
+        die(f"No {pkg}_*.orig.tar.gz found under {outdir} to verify")
+
+
+def sign_and_upload(v, identity, mode, verify_orig=True):
     section("Phase 7: Sign and upload" if mode == "rc" else "Phase 8: Sign and upload")
     outdir = v["outdir"]
     gpgkey = identity["GPGKEY"]
+    private_dir(outdir)
 
     # ── Step 1: GPG signing ──────────────────────────────────────────────────
     print(f"\n── Step 1: GPG signing  (key: {gpgkey})")
     subdirs = ["ppa"] if mode == "rc" else ["debian", "ubuntu"]
+    if verify_orig:
+        verify_orig_tarballs(outdir, subdirs, v["pkg"])
+    debian_sha = review_debian_latest()
+    to_sign = [f for subdir in subdirs
+               for f in sorted((outdir / subdir).glob("*_source.changes"))]
+    for f in to_sign:
+        print(f"  {f.relative_to(outdir)}")
+    # Always asks, whatever -i says: this is the step that publishes under
+    # the maintainer's signature.  Everything before it was reversible.
+    if not confirm(f"  Sign {len(to_sign)} source package(s) with {gpgkey} and "
+                   f"continue to upload?", always=True):
+        die("Not signed.")
     signed = 0
     for subdir in subdirs:
         for f in sorted((outdir / subdir).glob("*_source.changes")):
@@ -1781,6 +1881,7 @@ def sign_and_upload(v, identity, mode):
     if not signed:
         die(f"No *_source.changes files found under {outdir}")
     print(f"  ✓ {signed} file(s) signed.")
+    record_debian_latest(debian_sha)
 
     # ── Step 2: PPA (RC only) ────────────────────────────────────────────────
     if mode == "rc":
@@ -1893,11 +1994,47 @@ def update_website_screenshots(v):
 # removes it afterwards.  The root-level debian/ is gitignored so it can
 # never be committed here by accident.
 
+_DEBIAN_LATEST_SEEN = RELEASE_CACHE / "debian-latest.last-signed"
+
+
+def review_debian_latest():
+    """Show what changed on salsa/debian/latest since the last release we
+    signed, so the packaging that is about to be built, signed and uploaded
+    under the maintainer's key has at least been looked at.  debian/ is
+    fetched at tip from a repository other people can push to."""
+    new = run(["git", "-C", str(BYOBU_SRC), "rev-parse", "salsa/debian/latest"],
+              capture=True).stdout.strip()
+    last = _DEBIAN_LATEST_SEEN.read_text().strip() if _DEBIAN_LATEST_SEEN.exists() else ""
+    print(f"  salsa/debian/latest: {new[:12]}"
+          + (f"  (last signed: {last[:12]})" if last else "  (no record of a previous release)"))
+    if last and last != new:
+        r = run(["git", "-C", str(BYOBU_SRC), "log", "--oneline", "--no-decorate",
+                 f"{last}..{new}", "--", "debian"], capture=True, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            print("  debian/ commits since the last release you signed:")
+            for line in r.stdout.strip().splitlines():
+                print(f"    {line}")
+            r = run(["git", "-C", str(BYOBU_SRC), "diff", "--stat", f"{last}..{new}",
+                     "--", "debian"], capture=True, check=False)
+            for line in r.stdout.strip().splitlines():
+                print(f"    {line}")
+        else:
+            print(f"  (history from {last[:12]} is not linear to {new[:12]}; "
+                  f"review it by hand: git log {last[:12]}..{new[:12]} -- debian)")
+    return new
+
+
+def record_debian_latest(sha):
+    private_dir(RELEASE_CACHE)
+    _DEBIAN_LATEST_SEEN.write_text(sha + "\n")
+
+
 def prepare_debian():
     dst = BYOBU_SRC / "debian"
     if dst.exists():
         shutil.rmtree(dst)
     run(["git", "-C", str(BYOBU_SRC), "fetch", "salsa", "debian/latest"])
+    review_debian_latest()
     run([
         "bash", "-c",
         f"git -C {shlex.quote(str(BYOBU_SRC))} archive salsa/debian/latest debian "
@@ -1975,29 +2112,31 @@ def push_salsa(v, identity):
     section("Phase 9b: gbp import-orig (upstream/latest, merged into debian/latest)")
 
     tarball_name = f"{v['pkg']}_{base_ver}.orig.tar.gz"
-    tarball = Path(tempfile.gettempdir()) / tarball_name
-
-    print(f"  Generating {tarball_name} from tag {tag}…")
-    run([
-        "git", "-C", str(BYOBU_SRC), "archive",
-        "--format=tar.gz",
-        f"--prefix={v['pkg']}-{base_ver}/",
-        f"--output={tarball}",
-        tag,
-        # .gitignore's /debian/ rule exists only to keep prepare_debian()'s
-        # transient, Docker-only checkout out of *this* repo's working tree
-        # (see the comment above prepare_debian()) -- it has no business as
-        # "upstream source". gbp import-orig merges this tarball's tree into
-        # debian/latest, so shipping it would merge that rule into the actual
-        # Debian packaging branch's own .gitignore, where it then makes every
-        # `git add debian/<anything>` -- including the dch commit below --
-        # look like an attempt to add an ignored path. Exactly what happened
-        # cutting 7.17.
-        "--", ".", ":!.gitignore",
-    ])
-    print(f"  ✓ {tarball}")
 
     with tempfile.TemporaryDirectory(prefix="byobu-salsa-") as tmpdir:
+        # The tarball lives in this private, unpredictable directory, not in
+        # $TMPDIR under a guessable name where a pre-planted file or symlink
+        # could be what git archive writes into and gbp import-orig reads back.
+        tarball = Path(tmpdir) / tarball_name
+        print(f"  Generating {tarball_name} from tag {tag}…")
+        run([
+            "git", "-C", str(BYOBU_SRC), "archive",
+            "--format=tar.gz",
+            f"--prefix={v['pkg']}-{base_ver}/",
+            f"--output={tarball}",
+            tag,
+            # .gitignore's /debian/ rule exists only to keep prepare_debian()'s
+            # transient, Docker-only checkout out of *this* repo's working tree
+            # (see the comment above prepare_debian()) -- it has no business as
+            # "upstream source". gbp import-orig merges this tarball's tree into
+            # debian/latest, so shipping it would merge that rule into the actual
+            # Debian packaging branch's own .gitignore, where it then makes every
+            # `git add debian/<anything>` -- including the dch commit below --
+            # look like an attempt to add an ignored path. Exactly what happened
+            # cutting 7.17.
+            "--", ".", ":!.gitignore",
+        ])
+        print(f"  ✓ {tarball}")
         salsa_clone = Path(tmpdir) / "byobu"
         print("  Cloning Salsa…")
         run(["git", "clone", "git@salsa.debian.org:debian/byobu.git",
@@ -2239,7 +2378,8 @@ def run_salsa_ci():
     banner("Salsa CI local simulation (docker debian:sid + gbp buildpackage)")
     print("  Fetching salsa/pristine-tar for the simulation…")
     run(["git", "-C", str(BYOBU_SRC), "fetch", "salsa", "pristine-tar"], check=False)
-    bundle = Path(tempfile.gettempdir()) / "byobu-pristine-tar.bundle"
+    bundle_dir = Path(tempfile.mkdtemp(prefix="byobu-pristine-"))
+    bundle = bundle_dir / "byobu-pristine-tar.bundle"
     had_local_branch = run(
         ["git", "-C", str(BYOBU_SRC), "rev-parse", "--verify", "-q", "pristine-tar"],
         check=False, capture=True,
@@ -2260,7 +2400,7 @@ def run_salsa_ci():
         "-v", f"{bundle}:/pristine-tar.bundle:ro",
         "debian:sid", "bash", "-c", _SALSA_CI_SCRIPT,
     ])
-    bundle.unlink(missing_ok=True)
+    shutil.rmtree(bundle_dir, ignore_errors=True)
     print("  ✓ Salsa CI simulation PASSED")
     print("    Safe to push to salsa — gbp buildpackage will succeed.")
 
@@ -2340,6 +2480,11 @@ def main():
             "Resume from this phase, reusing the existing /tmp/byobu-release-* dir. "
             "Phases: 3 4 5 5b(=6b) 6c 6e 6 6d 7 8 9"
         ),
+    )
+    parser.add_argument(
+        "--no-verify-orig", action="store_true",
+        help="Skip checking that each .orig.tar.gz equals `git archive HEAD` "
+             "before signing (only if you understand why it differs)",
     )
     parser.add_argument(
         "--interactive", "-i",
@@ -2426,7 +2571,7 @@ def main():
                 update_homebrew_byobu(v, tap_byobu)
 
         if should_run("7", start_from):
-            sign_and_upload(v, identity, mode)
+            sign_and_upload(v, identity, mode, verify_orig=not args.no_verify_orig)
 
         if mode == "final" and should_run("8", start_from):
             update_website_screenshots(v)
