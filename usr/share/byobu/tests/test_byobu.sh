@@ -1203,12 +1203,6 @@ assert_true "manifest: apt invoked with -- before the package list" "grep -q 'ap
 assert_false "manifest: no plaintext http:// default remains" "grep -q 'http://paste' '$_man'"
 rm -rf "$_man_tmp"; unset _man _man_tmp _man_out
 
-# tmpfsffs: root must never glob /tmp into mv's argument list
-_tff="${BYOBU_PREFIX}/bin/tmpfsffs"
-assert_false "tmpfsffs: no 'mv /tmp/*' glob" "grep -q 'mv /tmp/\*' '$_tff'"
-assert_true  "tmpfsffs: uses find -exec mv -t ... --" "grep -q 'find /tmp -mindepth 1 -maxdepth 1 -exec mv -t .* -- {} +' '$_tff'"
-unset _tff
-
 # printf_status: "#" from data must reach tmux doubled, screen untouched
 out=$(BYOBU_BACKEND=tmux printf_status 'host#(id)#{pane_current_path}#[fg=red]x')
 assert_eq "printf_status tmux: every # doubled" "$out" 'host##(id)##{pane_current_path}##[fg=red]x'

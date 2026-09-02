@@ -28,10 +28,10 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     safety property worth keeping. Voice input deliberately not
     included -- Android's own keyboard already has voice-to-text built
     in
-  * usr/bin/Makefile.am: install tmpfsffs -- it has been missing from
-    dist_bin_SCRIPTS since it was added, so it never actually shipped in
-    any package; the 2026-09 security audit's new install-location test
-    was the first thing to actually notice
+  * usr/bin/tmpfsffs: removed. Never actually shipped in any package
+    (missing from dist_bin_SCRIPTS since it was added) and was always a
+    proof-of-concept, not a real part of byobu -- rather than fix its
+    packaging, drop it entirely
   * usr/share/byobu/tests/test_byobu.sh: fix Section 42's ulevel/ugraph/
     layout checks to fall back to the installed script when the .in
     source template isn't present (an installed package never ships
@@ -44,7 +44,8 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     build + install (not just source-tree): 225 passing, was 220 passed
     / 5 failed
   * security: fixes from the 2026-09 security audit (CVE requests pending
-    for the first four)
+    for the first three; a fourth, in tmpfsffs, no longer applies now
+    that tmpfsffs has been removed rather than fixed -- see above)
     - manifest: validate package names and pass "--" before them; a
       pastebin or file listing could put apt options such as
       -oDPkg::Pre-Invoke::= on a "sudo apt install" command line (root
@@ -52,9 +53,6 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     - battery: parse /sys uevent instead of sourcing it as shell; a USB
       HID battery/UPS with a crafted model or serial string could run
       code as the user on every status refresh
-    - tmpfsffs: move /tmp entries with find -exec mv -t -- rather than a
-      shell glob, which let a local user's file named like an mv option
-      redirect root's moves; refuse to run as non-root
     - select-session.py: remove eval() of the session-chooser answer, a
       restricted-shell (ForceCommand/rbash/kiosk) escape
     - trustmux: "stop"/"disable"/"rm" remove the tailscale serve mapping
