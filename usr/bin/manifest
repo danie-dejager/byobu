@@ -35,14 +35,48 @@ export_packages() {
 	fi
 }
 
+# Only well-formed Debian package names reach apt.  Every token here comes
+# from a manifest we did not write (a pastebin, a URL, a file someone sent),
+# and it is passed to "sudo apt install": a token beginning with "-" would be
+# parsed by apt as an option, and -oDPkg::Pre-Invoke::=... runs a shell as
+# root.  Debian Policy 5.6.1: lowercase alphanumerics plus "+-.", at least two
+# characters, starting with an alphanumeric.
+filter_packages() {
+	grep "^ii[[:space:]]" | col2 | grep -E '^[a-z0-9][a-z0-9.+-]+$' | sort -u
+}
+
 import_packages() {
-	if [ "$OBJECT" = "-" ]; then
-		sudo apt install $(cat /dev/stdin | grep "^ii\s" | col2)
-	elif echo "$OBJECT" | grep -qs ".*://.*"; then
-		sudo apt install $(wget -q -O- "$OBJECT" | grep -A 999999999 '<div class="paste"><pre>' | grep -B 999999999 "^</pre>" | sed -e "s/.*<pre>//" -e "s/^<\/pre>.*//" | base64 -d | gunzip | grep "^ii\s" | col2)
-	else
-		sudo apt install $(cat "$OBJECT" | grep "^ii\s" | col2)
+	local pkgs
+	case "$OBJECT" in
+		-)
+			pkgs=$(filter_packages)
+		;;
+		https://*)
+			pkgs=$(wget -q -O- "$OBJECT" | grep -A 999999999 '<div class="paste"><pre>' | grep -B 999999999 "^</pre>" | sed -e "s/.*<pre>//" -e "s/^<\/pre>.*//" | base64 -d | gunzip | filter_packages)
+		;;
+		*://*)
+			echo "ERROR: refusing to import a package list over an unencrypted URL; use https://" 1>&2
+			exit 1
+		;;
+		*)
+			pkgs=$(filter_packages < "$OBJECT")
+		;;
+	esac
+	if [ -z "$pkgs" ]; then
+		echo "ERROR: no valid package names found in $OBJECT" 1>&2
+		exit 1
 	fi
+	echo "Packages to install:"
+	echo "$pkgs" | tr '\n' ' ' | fold -s -w 78
+	echo
+	printf "Proceed with 'sudo apt install'? [y/N] "
+	read -r ans < /dev/tty || exit 1
+	case "$ans" in
+		y|Y|yes|YES) ;;
+		*) echo "Aborted." 1>&2; exit 1 ;;
+	esac
+	# shellcheck disable=SC2086  # $pkgs is validated, one name per word
+	sudo apt install -- $pkgs
 }
 
 usage() {
@@ -67,7 +101,7 @@ fi
 if [ "$ACTION" = "import" ]; then
 	import_packages
 elif [ "$ACTION" = "export" ]; then
-	[ -n "$OBJECT" ] || OBJECT="http://paste.ubuntu.com"
+	[ -n "$OBJECT" ] || OBJECT="https://paste.ubuntu.com"
 	export_packages
 else
 	usage

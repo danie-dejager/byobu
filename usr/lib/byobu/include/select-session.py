@@ -174,9 +174,12 @@ if len(sessions) > 1:
 				choice = 1
 				break
 			try:
-				choice = int(user_input)
-			except Exception:
-				choice = int(eval(user_input))
+				choice = int(user_input.strip())
+			except ValueError:
+				# Never eval() what the user typed: this chooser can be
+				# the only thing between a restricted login (ForceCommand,
+				# rbash, kiosk) and an unrestricted shell.
+				choice = -1
 			if choice >= 1 and choice < i:
 				break
 			else:

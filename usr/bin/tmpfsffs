@@ -20,12 +20,23 @@
 
 set -e
 
+if [ "$(id -u)" != "0" ]; then
+	echo "ERROR: $0 must be run as root" 1>&2
+	exit 1
+fi
+
 if grep -qs "^tmpfs[[:space:]]/tmp[[:space:]]tmpfs" /etc/fstab; then
 	echo "SUCCESS: /tmp is already a tmpfs"
 else
 	echo "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec" >> /etc/fstab
 	dir=$(mktemp -d "/dev/shm/tmp.XXXXXXXXXXXX")
-	mv /tmp/* /tmp/.* "$dir/"
+	# /tmp is world-writable, so its entries are attacker-named.  Never let a
+	# shell glob of it become mv's argument list: an entry called
+	# "--target-directory=/root/.ssh" would be parsed as an option and
+	# redirect everyone's files; and "/tmp/.*" matches "." and "..".  find
+	# hands each real entry to mv after "--", so names are only ever data.
+	find /tmp -mindepth 1 -maxdepth 1 -exec mv -t "$dir" -- {} +
 	mount -a
-	mv "$dir/"* "$dir/."* /tmp/
+	find "$dir" -mindepth 1 -maxdepth 1 -exec mv -t /tmp -- {} +
+	rmdir "$dir"
 fi

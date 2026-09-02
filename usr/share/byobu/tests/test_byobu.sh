@@ -1145,6 +1145,71 @@ fi
 unset _enable_src _disable_src _marker
 
 # ---------------------------------------------------------------------------
+# Section 42 — security regressions (2026-09 audit)
+# ---------------------------------------------------------------------------
+
+# battery: /sys uevent is parsed, never sourced.  A USB HID battery/UPS can
+# put arbitrary bytes in MODEL_NAME/SERIAL_NUMBER, which used to be sourced
+# as shell.  Point $BATTERY at a hostile fake and make sure nothing runs.
+_bat_tmp=$(mktemp -d)
+_bat_marker="$_bat_tmp/pwned"
+mkdir -p "$_bat_tmp/BAT9"
+cat > "$_bat_tmp/BAT9/uevent" <<EOF
+POWER_SUPPLY_NAME=BAT9
+POWER_SUPPLY_TYPE=Battery
+POWER_SUPPLY_STATUS=Discharging
+POWER_SUPPLY_PRESENT=1
+POWER_SUPPLY_MODEL_NAME=\$(touch $_bat_marker)
+POWER_SUPPLY_SERIAL_NUMBER="; touch $_bat_marker.2; "
+POWER_SUPPLY_MANUFACTURER=\`touch $_bat_marker.3\`
+POWER_SUPPLY_CAPACITY=42
+POWER_SUPPLY_CHARGE_NOW=42; touch $_bat_marker.4
+EOF
+_bat_out=$(
+	BATTERY="$_bat_tmp/BAT9" BYOBU_OSTYPE=Linux BYOBU_CHARMAP=UTF-8
+	export BATTERY BYOBU_OSTYPE BYOBU_CHARMAP
+	# The real host's /sys batteries are still globbed; the fake one is
+	# processed first, and on a host without a battery it is the only one.
+	. "${BYOBU_PREFIX}/lib/${PKG}/battery"
+	__battery 2>/dev/null
+)
+assert_false "battery: \$(...) in MODEL_NAME does not execute" "[ -e '$_bat_marker' ]"
+assert_false "battery: quote-breakout in SERIAL_NUMBER does not execute" "[ -e '$_bat_marker.2' ]"
+assert_false "battery: backticks in MANUFACTURER do not execute" "[ -e '$_bat_marker.3' ]"
+assert_false "battery: non-numeric CHARGE_NOW is rejected, not executed" "[ -e '$_bat_marker.4' ]"
+assert_true  "battery: sane keys from the same uevent are still used" \
+	"printf '%s' \"$_bat_out\" | grep -q '42'"
+assert_true  "battery: no 'source' of uevent remains in the script" \
+	"! grep -q 'uevent.*>.*TMP_FILE' '${BYOBU_PREFIX}/lib/${PKG}/battery'"
+rm -rf "$_bat_tmp"; unset _bat_tmp _bat_marker _bat_out
+
+# select-session.py: user input must never be eval()'d (restricted-shell escape)
+_sel="${BYOBU_PREFIX}/lib/${PKG}/include/select-session.py"
+assert_false "select-session.py: no eval() of user input" "grep -v '^[[:space:]]*#' '$_sel' | grep -q 'eval('"
+unset _sel
+
+# manifest: only Debian package names may reach 'sudo apt install'
+_man="${BYOBU_PREFIX}/bin/manifest"
+_man_tmp=$(mktemp -d)
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_man_tmp/col2"
+_man_out=$(
+	PATH="$_man_tmp:$PATH"
+	# Pull filter_packages() out of the script without running it.
+	eval "$(sed -n '/^filter_packages() {/,/^}/p' "$_man")"
+	printf 'ii  bash  5.2  amd64  shell\nii  -oDPkg::Pre-Invoke::=id  1  all  x\nii  ../evil  1  all  x\nii  Libfoo  1  all  x\nii  zsh  5.9  amd64  shell\n' | filter_packages | tr '\n' ' '
+)
+assert_eq "manifest: option-like and malformed names are dropped" "$_man_out" "bash zsh "
+assert_true "manifest: apt invoked with -- before the package list" "grep -q 'apt install -- ' '$_man'"
+assert_false "manifest: no plaintext http:// default remains" "grep -q 'http://paste' '$_man'"
+rm -rf "$_man_tmp"; unset _man _man_tmp _man_out
+
+# tmpfsffs: root must never glob /tmp into mv's argument list
+_tff="${BYOBU_PREFIX}/bin/tmpfsffs"
+assert_false "tmpfsffs: no 'mv /tmp/*' glob" "grep -q 'mv /tmp/\*' '$_tff'"
+assert_true  "tmpfsffs: uses find -exec mv -t ... --" "grep -q 'find /tmp -mindepth 1 -maxdepth 1 -exec mv -t .* -- {} +' '$_tff'"
+unset _tff
+
+# ---------------------------------------------------------------------------
 # Results
 # ---------------------------------------------------------------------------
 
