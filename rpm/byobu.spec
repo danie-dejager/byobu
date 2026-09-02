@@ -125,6 +125,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/%{name}.desktop
 %{_bindir}/ctail
 %{_bindir}/manifest
 %{_bindir}/purge-old-kernels
+%{_bindir}/whats-my-public-ip
 %{_bindir}/wifi-status
 %{_datadir}/%{name}/
 %{_datadir}/applications/%{name}.desktop

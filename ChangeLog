@@ -43,6 +43,12 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     ones failed outright. Verified against a real dpkg-buildpackage
     build + install (not just source-tree): 225 passing, was 220 passed
     / 5 failed
+  * rpm/byobu.spec: add whats-my-public-ip to %files -- unlike Debian's
+    dh_auto_install, rpmbuild fails the whole build if anything make
+    install actually installs isn't explicitly listed, which is exactly
+    what surfaced once whats-my-public-ip started actually being
+    installed. Verified against a real rpmbuild + dnf install round
+    trip: 223 passing, 0 failed
   * usr/bin/Makefile.am: install whats-my-public-ip -- like tmpfsffs, it
     has been missing from dist_bin_SCRIPTS since it was added and so
     never actually shipped in any package. Its own new test masked this
