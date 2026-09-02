@@ -203,3 +203,207 @@ class TestCertReuse(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# CLI side
+# ---------------------------------------------------------------------------
+
+import shutil
+import subprocess
+import trustmux._ctl as ctl
+import trustmux._advertise as adv
+import trustmux._enable as enable
+import trustmux._disable as disable
+import trustmux._unpair as unpair
+from unittest.mock import call
+
+
+class TestServeMappingLifecycle(unittest.TestCase):
+    """The tailscale serve mapping must not outlive the daemon: while it does,
+    it forwards the tailnet name to a loopback port any local user could bind."""
+
+    def setUp(self):
+        self.inst = ctl.Instance('servelife')
+        self.inst.ensure_dirs()
+        self.addCleanup(shutil.rmtree, self.inst.state, True)
+        p = patch('trustmux._ctl.daemon_info', return_value=None)
+        p.start(); self.addCleanup(p.stop)
+
+    def test_serve_start_records_a_marker(self):
+        with patch('trustmux._ctl._check_tmux', return_value=True), \
+             patch('trustmux._ctl._check_tls', return_value=True), \
+             patch('trustmux._ctl.subprocess.run'), \
+             patch('trustmux._ctl._ts_host', return_value='h.ts.net'), \
+             patch('trustmux._ctl._ensure_ts_serve', return_value=True), \
+             patch('trustmux._ctl._launch', return_value=4242), \
+             patch('trustmux._ctl.can_use_serve', return_value=True), \
+             patch('builtins.print'):
+            self.assertEqual(ctl.cmd_start('serve', 7432, self.inst), 0)
+        self.assertEqual(self.inst.serve_marker.read_text().strip(), '7432')
+
+    def test_stop_removes_the_mapping_and_the_marker(self):
+        self.inst.serve_marker.write_text('7432\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.run') as run, \
+             patch('builtins.print'):
+            self.assertEqual(ctl.cmd_stop(7432, self.inst), 0)
+        self.assertIn(call(['tailscale', 'serve', '--bg', '7432', 'off'],
+                           check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15),
+                      run.call_args_list)
+        self.assertFalse(self.inst.serve_marker.exists())
+
+    def test_stop_keep_serve_leaves_it_and_says_what_that_means(self):
+        self.inst.serve_marker.write_text('7432\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.run') as run, \
+             patch('builtins.print') as mock_print:
+            ctl.cmd_stop(7432, self.inst, keep_serve=True)
+        run.assert_not_called()
+        self.assertTrue(self.inst.serve_marker.exists())
+        printed = ' '.join(str(c) for c in mock_print.call_args_list)
+        self.assertIn('nothing listening', printed)
+
+    def test_stop_without_a_marker_never_touches_tailscale(self):
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.run',
+                   side_effect=AssertionError('must not shell out')), \
+             patch('builtins.print'):
+            self.assertEqual(ctl.cmd_stop(7432, self.inst), 0)
+
+    def test_failed_removal_keeps_the_marker_and_warns(self):
+        self.inst.serve_marker.write_text('7432\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.run',
+                   side_effect=subprocess.CalledProcessError(1, 'tailscale')), \
+             patch('trustmux._ctl.subprocess.check_output',
+                   return_value='https://h.ts.net -> http://127.0.0.1:7432'), \
+             patch('builtins.print') as mock_print:
+            ctl.cmd_stop(7432, self.inst)
+        self.assertTrue(self.inst.serve_marker.exists())
+        printed = ' '.join(str(c) for c in mock_print.call_args_list)
+        self.assertIn('could not remove', printed)
+
+    def test_status_warns_while_a_mapping_points_at_nothing(self):
+        self.inst.serve_marker.write_text('7432\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.check_output',
+                   return_value='https://h.ts.net -> http://127.0.0.1:7432'), \
+             patch('builtins.print') as mock_print:
+            self.assertEqual(ctl.cmd_status(7432, self.inst), 0)
+        printed = ' '.join(str(c) for c in mock_print.call_args_list)
+        self.assertIn('nothing is listening', printed)
+
+    def test_status_forgets_a_marker_whose_mapping_is_already_gone(self):
+        self.inst.serve_marker.write_text('7432\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.check_output', return_value=''), \
+             patch('builtins.print'):
+            ctl.cmd_status(7432, self.inst)
+        self.assertFalse(self.inst.serve_marker.exists())
+
+    def test_status_prints_the_certificate_fingerprint(self):
+        fp = 'AA:BB:' * 15 + 'CC:DD'
+        with patch('trustmux._ctl.daemon_info',
+                   return_value={'pid': 1, 'port': 7432, 'scheme': 'https',
+                                 'host': '0.0.0.0', 'advertise': [], 'fingerprint': fp}), \
+             patch('trustmux._ctl._pid', return_value=1), \
+             patch('builtins.print') as mock_print:
+            ctl.cmd_status(7432, self.inst)
+        printed = ' '.join(str(c) for c in mock_print.call_args_list)
+        self.assertIn(fp, printed)
+
+
+class TestAdvertiseConfigFileChecks(unittest.TestCase):
+    """The instance config can name a program to run, so anything that lets
+    someone else supply it is code execution: symlinks, foreign owners,
+    writable parents."""
+
+    def setUp(self):
+        self.inst = ctl.Instance('advcfg')
+        self.inst.config_file.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, _paths.config_dir(), True)
+
+    def _write(self, mode=0o600):
+        self.inst.config_file.write_text(json.dumps({'advertise': ['a.example.com']}))
+        self.inst.config_file.chmod(mode)
+
+    def test_own_0600_file_in_own_0700_dirs_is_read(self):
+        self._write()
+        self.assertEqual(adv.resolve_sources(None, False, self.inst), ['a.example.com'])
+
+    def test_symlinked_config_is_refused(self):
+        real = self.inst.config_file.with_name('real.json')
+        real.write_text(json.dumps({'advertise': ['a.example.com']}))
+        real.chmod(0o600)
+        self.inst.config_file.symlink_to(real)
+        with self.assertRaisesRegex(adv.AdvertiseError, 'symlink'):
+            adv.resolve_sources(None, False, self.inst)
+
+    def test_world_writable_parent_is_refused(self):
+        self._write()
+        self.inst.config_file.parent.chmod(0o777)
+        self.addCleanup(self.inst.config_file.parent.chmod, 0o700)
+        with self.assertRaisesRegex(adv.AdvertiseError, 'writable by group or other'):
+            adv.resolve_sources(None, False, self.inst)
+
+    def test_sticky_world_writable_parent_is_tolerated(self):
+        self._write()
+        self.inst.config_file.parent.chmod(0o1777)
+        self.addCleanup(self.inst.config_file.parent.chmod, 0o700)
+        self.assertEqual(adv.resolve_sources(None, False, self.inst), ['a.example.com'])
+
+    def test_parent_writable_by_own_primary_group_is_tolerated(self):
+        # Ubuntu user-private groups: umask 002 makes every dir 0775.
+        self._write()
+        d = self.inst.config_file.parent
+        d.chmod(0o775)
+        self.addCleanup(d.chmod, 0o700)
+        if d.stat().st_gid != os.getgid():
+            self.skipTest('temp dir not in primary group')
+        self.assertEqual(adv.resolve_sources(None, False, self.inst), ['a.example.com'])
+
+    def test_group_writable_file_is_still_refused(self):
+        self._write(0o660)
+        with self.assertRaisesRegex(adv.AdvertiseError, 'writable by group'):
+            adv.resolve_sources(None, False, self.inst)
+
+
+class TestInstanceNameStrictness(unittest.TestCase):
+    def test_trailing_newline_is_rejected(self):
+        with patch('builtins.print'), self.assertRaises(SystemExit):
+            _paths.resolve_instance('work\n')
+
+    def test_plain_name_still_accepted(self):
+        self.assertEqual(_paths.resolve_instance('work').name, 'work')
+
+
+class TestAtomicProfileRewrite(unittest.TestCase):
+    def test_rewrite_keeps_mode_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / '.profile'
+            dest.write_text('a\nb\n')
+            dest.chmod(0o640)
+            enable.rewrite_in_place(dest, 'a\n')
+            self.assertEqual(dest.read_text(), 'a\n')
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode), 0o640)
+            self.assertEqual(sorted(p.name for p in Path(td).iterdir()), ['.profile'])
+
+    def test_disable_uses_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / '.profile'
+            dest.write_text('keep\ntrustmux start 2>/dev/null || true\n')
+            with patch('trustmux._disable.rewrite_in_place',
+                       wraps=enable.rewrite_in_place) as rw:
+                disable._remove_hook(dest, ctl.Instance())
+            rw.assert_called_once()
+            self.assertEqual(dest.read_text(), 'keep\n')
+
+
+class TestUnpairLabelSanitised(unittest.TestCase):
+    def test_control_bytes_are_replaced(self):
+        self.assertEqual(unpair._ua_short('Evil\x1b[2Jthing'), 'Evil?[2Jthing')
+
+    def test_known_browsers_still_shortened(self):
+        self.assertEqual(unpair._ua_short('Mozilla/5.0 ... Mobile Safari'), 'Mobile')

@@ -114,6 +114,18 @@ class Instance:
     def pid_file(self) -> Path:
         return self.state / "trustmux.pid"
 
+    @property
+    def serve_marker(self) -> Path:
+        """Present while this instance owns a `tailscale serve` mapping.
+
+        Written by `start` in serve mode and removed by `stop`, which tears the
+        mapping down.  It exists so that stop/status can know a mapping is
+        there without asking tailscale -- a mapping that outlives the daemon
+        forwards the tailnet to a loopback port nothing of ours is listening
+        on, which any other local user could then bind.
+        """
+        return self.state / "serve"
+
     def label(self) -> str:
         """' --name NAME' for non-default instances, for printed hints."""
         return "" if self.name == DEFAULT_INSTANCE else f" --name {self.name}"
@@ -132,7 +144,9 @@ def resolve_instance(explicit: str | None = None) -> Instance:
         name = os.environ.get(INSTANCE_ENV, "").strip() or DEFAULT_INSTANCE
     else:
         name = explicit
-    if not INSTANCE_RE.match(name):
+    # fullmatch, not match: with "$", a trailing newline would pass and become
+    # part of a directory name and of the hook line written to ~/.profile.
+    if not INSTANCE_RE.fullmatch(name):
         print(f"Error: invalid instance name {name!r} — use letters, digits, "
               "'.', '_' or '-' (max 32, not starting with '.').", file=sys.stderr)
         sys.exit(2)

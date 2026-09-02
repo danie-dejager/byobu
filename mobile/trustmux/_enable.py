@@ -60,6 +60,25 @@ def is_hook_for(line: str, inst: Instance | None = None) -> bool:
             and not any(flag in line for flag in _NAME_FLAGS))
 
 
+def rewrite_in_place(dest: Path, text: str) -> None:
+    """Replace dest's contents atomically, keeping its mode.
+
+    write_text() truncates first and writes second; a crash between the two
+    leaves an empty ~/.profile.  Write beside it and rename over it instead.
+    """
+    mode = dest.stat().st_mode & 0o777
+    tmp = dest.with_name(f".{dest.name}.trustmux-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _install_hook(dest: Path, hook: str = _HOOK, inst: Instance | None = None) -> None:
     if not dest.exists():
         return
@@ -70,7 +89,7 @@ def _install_hook(dest: Path, hook: str = _HOOK, inst: Instance | None = None) -
         # instead of silently keeping the old port.
         updated = [hook if is_hook_for(l, inst) else l for l in lines]
         if updated != lines:
-            dest.write_text("".join(updated))
+            rewrite_in_place(dest, "".join(updated))
         return
     with dest.open("a") as f:
         f.write(f"\n{hook}")

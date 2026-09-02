@@ -22,17 +22,20 @@ decides what the certificate attests -- and a browser rejects a certificate
 that omits the name in the URL outright rather than offering the click-through
 a self-signed one gets.  There is no useful "warning" outcome here.
 """
+import errno
 import ipaddress
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import time
+from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
-from trustmux._paths import Instance
+from trustmux._paths import Instance, config_dir
 
 ADVERTISE_ENV = "TRUSTMUX_ADVERTISE"
 CMD_PREFIX = "cmd:"
@@ -272,23 +275,79 @@ def check_sources(sources: list[str], scheme: str = "https",
             normalize(source, scheme, port)
 
 
+def _check_parents(start: Path, stop: Path) -> None:
+    """Refuse if any directory from start up to and including stop is
+    writable by group or other and not sticky, or is not ours.
+
+    A group-writable ~/.config/trustmux/instances/ lets a group member drop or
+    rename in a 0644 default.json of their own, which the mode check on the
+    file alone would then accept.  Group-writable by the user's own primary
+    group is allowed: with user-private groups (the Debian/Ubuntu default,
+    umask 002) every directory the user makes is 0775 and nobody else is in
+    that group.
+    """
+    d = start
+    seen = set()
+    while True:
+        try:
+            st = d.stat()
+        except OSError:
+            return          # a missing parent means a missing file; nothing to read
+        if st.st_uid not in (os.getuid(), 0):
+            raise AdvertiseError(
+                f"{d} is owned by uid {st.st_uid}, not by you — refusing to read "
+                f"config beneath it.")
+        if st.st_mode & stat.S_ISVTX:
+            pass            # sticky: others may add files but not replace ours
+        elif st.st_mode & 0o002 or (st.st_mode & 0o020 and st.st_gid != os.getgid()):
+            raise AdvertiseError(
+                f"{d} is writable by group or other (mode {st.st_mode & 0o777:04o}) "
+                f"— anyone who can write it can replace the config beneath it. "
+                f"chmod go-w it.")
+        if d == stop or d == d.parent or d in seen:
+            return
+        seen.add(d)
+        d = d.parent
+
+
 def _from_config(inst: Instance) -> list[str]:
     """Advertise sources from this instance's config file, or [] if it has none."""
     path = inst.config_file
+    # A source can name a program to run, so a file anyone else can write --
+    # or can replace, by writing one of its parent directories -- is a way to
+    # have this daemon run their code.  Open first and check the open file,
+    # not the path, so that what is checked is what is read; refuse a
+    # symlink outright, since its target's mode says nothing about who could
+    # repoint the link; and require it to be ours.
     try:
-        st = path.stat()
-    except OSError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
         return []
-    # A source can name a program to run, so a file anyone else can write is a
-    # way to have this daemon run their code.
-    if st.st_mode & 0o022:
-        raise AdvertiseError(
-            f"{path} is writable by group or other (mode {st.st_mode & 0o777:04o}) "
-            "and can name a program to run — refusing to read it. chmod 600 it.")
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise AdvertiseError(f"{path} is a symlink — refusing to read it; "
+                                 "write the file in place.") from None
+        raise AdvertiseError(f"cannot read {path}: {e}") from None
     try:
-        data = json.loads(path.read_text())
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise AdvertiseError(f"{path} is not a regular file — refusing to read it.")
+        if st.st_uid != os.getuid():
+            raise AdvertiseError(
+                f"{path} is owned by uid {st.st_uid}, not by you — refusing to read it.")
+        if st.st_mode & 0o022:
+            raise AdvertiseError(
+                f"{path} is writable by group or other (mode {st.st_mode & 0o777:04o}) "
+                "and can name a program to run — refusing to read it. chmod 600 it.")
+        _check_parents(path.parent, config_dir())
+        with os.fdopen(fd, "r") as f:
+            fd = -1
+            data = json.loads(f.read())
     except (OSError, ValueError) as e:
         raise AdvertiseError(f"cannot read {path}: {e}") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not isinstance(data, dict):
         raise AdvertiseError(f"{path}: expected a JSON object")
     raw = data.get("advertise")

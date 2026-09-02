@@ -711,6 +711,11 @@ class TestCmdStop(unittest.TestCase):
 
 class TestCmdStatus(unittest.TestCase):
 
+    def setUp(self):
+        # A serve-mode start elsewhere in the suite leaves the default
+        # instance's serve marker behind; status would then (rightly) warn.
+        ctl.Instance().serve_marker.unlink(missing_ok=True)
+
     def test_not_running(self):
         with patch('trustmux._ctl._pid', return_value=None):
             with patch('builtins.print') as mock_print:
