@@ -407,3 +407,153 @@ class TestUnpairLabelSanitised(unittest.TestCase):
 
     def test_known_browsers_still_shortened(self):
         self.assertEqual(unpair._ua_short('Mozilla/5.0 ... Mobile Safari'), 'Mobile')
+
+
+class TestDaemonRefusesRoot(unittest.TestCase):
+    def _main(self, euid, env):
+        import sys
+        with patch.object(sys, 'argv', ['trustmuxd', '--port', '7432']), \
+             patch('trustmux._daemon.os.geteuid', return_value=euid), \
+             patch.dict(os.environ, env, clear=False), \
+             patch('trustmux._daemon.migrate_legacy_layout',
+                   side_effect=RuntimeError('reached startup')), \
+             patch('builtins.print'):
+            return bm.main()
+
+    def test_root_is_refused_before_touching_anything(self):
+        os.environ.pop('TRUSTMUX_ALLOW_ROOT', None)
+        with self.assertRaises(SystemExit) as cm:
+            self._main(0, {})
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_root_override_and_normal_user_proceed(self):
+        with self.assertRaisesRegex(RuntimeError, 'reached startup'):
+            self._main(0, {'TRUSTMUX_ALLOW_ROOT': '1'})
+        os.environ.pop('TRUSTMUX_ALLOW_ROOT', None)
+        with self.assertRaisesRegex(RuntimeError, 'reached startup'):
+            self._main(1000, {})
+
+
+# ---------------------------------------------------------------------------
+# Serve mode over a Unix socket (follow-up to the port-squatting finding)
+# ---------------------------------------------------------------------------
+
+import asyncio
+import signal
+import tornado.httpserver
+import tornado.netutil
+
+
+class TestDaemonUnixListener(unittest.IsolatedAsyncioTestCase):
+    """The HTTP listener can be a Unix socket in the state dir, 0600, so
+    tailscale serve has nothing on loopback to proxy to and nobody else can
+    bind in our place."""
+
+    async def test_serves_http_over_a_0600_unix_socket(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'http.sock')
+            server = tornado.httpserver.HTTPServer(bm._make_app(), xheaders=True)
+            server.add_socket(tornado.netutil.bind_unix_socket(path, mode=0o600))
+            try:
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                reader, writer = await asyncio.open_unix_connection(path)
+                writer.write(b'GET /ping HTTP/1.1\r\nHost: h.ts.net\r\n'
+                             b'X-Forwarded-For: 100.64.0.9\r\nConnection: close\r\n\r\n')
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(), 5)
+                writer.close()
+            finally:
+                server.stop()
+                await server.close_all_connections()
+            head, _, body = raw.partition(b'\r\n\r\n')
+            self.assertIn(b'HTTP/1.1 401', head)
+            self.assertEqual(json.loads(body)['auth'], False)
+
+    async def test_stale_socket_file_is_replaced(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, 'http.sock')
+            old = tornado.netutil.bind_unix_socket(path)
+            old.close()                       # daemon died; file left behind
+            sock = tornado.netutil.bind_unix_socket(path, mode=0o600)
+            sock.close()
+            self.assertTrue(stat.S_ISSOCK(os.stat(path).st_mode))
+
+
+class TestUnixServeCli(unittest.TestCase):
+    def setUp(self):
+        self.inst = ctl.Instance('unixserve')
+        self.inst.ensure_dirs()
+        self.addCleanup(shutil.rmtree, self.inst.state, True)
+        p = patch('trustmux._ctl.daemon_info', return_value=None)
+        p.start(); self.addCleanup(p.stop)
+
+    def test_probe_reads_the_help_text(self):
+        with patch('trustmux._ctl.subprocess.run',
+                   return_value=subprocess.CompletedProcess([], 0,
+                       stdout='... a Unix domain socket (e.g., unix:/tmp/x.sock).', stderr='')):
+            self.assertTrue(ctl._ts_serve_supports_unix())
+        with patch('trustmux._ctl.subprocess.run',
+                   return_value=subprocess.CompletedProcess([], 0, stdout='old help', stderr='')):
+            self.assertFalse(ctl._ts_serve_supports_unix())
+        with patch('trustmux._ctl.subprocess.run', side_effect=FileNotFoundError):
+            self.assertFalse(ctl._ts_serve_supports_unix())
+
+    def _start(self, supports_unix, serve_ok=True, launch_pid=4242):
+        with patch('trustmux._ctl._check_tmux', return_value=True), \
+             patch('trustmux._ctl._check_tls', return_value=True), \
+             patch('trustmux._ctl.subprocess.run'), \
+             patch('trustmux._ctl._ts_host', return_value='h.ts.net'), \
+             patch('trustmux._ctl._ts_serve_supports_unix', return_value=supports_unix), \
+             patch('trustmux._ctl._ensure_ts_serve_target', return_value=serve_ok) as ensure, \
+             patch('trustmux._ctl._launch', return_value=launch_pid) as launch, \
+             patch('trustmux._ctl.os.kill') as kill, \
+             patch('trustmux._ctl.can_use_serve', return_value=True), \
+             patch('builtins.print'):
+            rc = ctl.cmd_start('serve', 7432, self.inst)
+        return rc, ensure, launch, kill
+
+    def test_unix_capable_tailscale_gets_a_socket_not_a_port(self):
+        rc, ensure, launch, _ = self._start(True)
+        self.assertEqual(rc, 0)
+        args = launch.call_args.args[1]
+        self.assertIn('--unix', args)
+        self.assertIn(str(self.inst.http_sock), args)
+        self.assertNotIn('--host', args)
+        ensure.assert_called_once_with(f'unix:{self.inst.http_sock}')
+        self.assertEqual(self.inst.serve_marker.read_text().strip(),
+                         f'unix:{self.inst.http_sock}')
+
+    def test_old_tailscale_falls_back_to_loopback_port(self):
+        rc, ensure, launch, _ = self._start(False)
+        self.assertEqual(rc, 0)
+        args = launch.call_args.args[1]
+        self.assertIn('--host', args)
+        self.assertIn('127.0.0.1', args)
+        ensure.assert_called_once_with('7432')
+        self.assertEqual(self.inst.serve_marker.read_text().strip(), '7432')
+
+    def test_failed_mapping_stops_the_daemon_it_just_started(self):
+        rc, _, _, kill = self._start(True, serve_ok=False)
+        self.assertEqual(rc, 1)
+        kill.assert_called_once_with(4242, signal.SIGTERM)
+        self.assertFalse(self.inst.serve_marker.exists())
+
+    def test_stop_removes_a_unix_mapping(self):
+        target = f'unix:{self.inst.http_sock}'
+        self.inst.serve_marker.write_text(target + '\n')
+        with patch('trustmux._ctl._pid', return_value=None), \
+             patch('trustmux._ctl.subprocess.run') as run, \
+             patch('builtins.print'):
+            self.assertEqual(ctl.cmd_stop(7432, self.inst), 0)
+        self.assertEqual(run.call_args.args[0], ['tailscale', 'serve', '--bg', target, 'off'])
+        self.assertFalse(self.inst.serve_marker.exists())
+
+    def test_marker_parsing(self):
+        self.inst.serve_marker.write_text('unix:/a/b/http.sock\n')
+        self.assertEqual(ctl._serve_marker_target(self.inst), 'unix:/a/b/http.sock')
+        self.inst.serve_marker.write_text('3389\n')
+        self.assertEqual(ctl._serve_marker_target(self.inst), '3389')
+        self.inst.serve_marker.write_text('garbage\n')
+        self.assertIsNone(ctl._serve_marker_target(self.inst))
+        self.assertEqual(ctl._serve_needle('unix:/x/y'), '/x/y')
+        self.assertEqual(ctl._serve_needle('7432'), ':7432')

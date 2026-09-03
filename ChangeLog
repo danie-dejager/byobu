@@ -30,6 +30,19 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     of pyproject.toml/uv.lock and Dependabot doesn't parse Ruby resource
     blocks (the exact class of gap release.py's
     check_homebrew_resources_fresh() exists to catch)
+  * security: follow-ups to the 2026-09 audit
+    - trustmux: in "start" (tailscale serve) mode the daemon now listens on
+      a Unix socket in its 0700 state directory and tailscale serve proxies
+      to it, so no loopback TCP port exists for another local user to bind
+      while the daemon is down; falls back to 127.0.0.1 on a tailscale too
+      old for "serve unix:"
+    - trustmux: trustmuxd refuses to run as root (TRUSTMUX_ALLOW_ROOT
+      overrides)
+    - release.py: before pinning a Homebrew formula to a PyPI sdist or a
+      GitHub release tarball, verify file by file that it is the source
+      built here; pin nixpkgs to a commit in the Nix smoke test
+    - Dependabot keeps the GitHub Actions SHA pins and requirements.txt
+      current
   * usr/bin/tmpfsffs: removed. Never actually shipped in any package
     (missing from dist_bin_SCRIPTS since it was added) and was always a
     proof-of-concept, not a real part of byobu -- rather than fix its
