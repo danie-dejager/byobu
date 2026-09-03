@@ -31,7 +31,7 @@ __distro() {
 	else
 		DISTRO="$BYOBU_DISTRO"
 	fi
-	color bold2; printf "%s" "$DISTRO"; color --
+	color bold2; printf_status "$DISTRO"; color --
 }
 
 # vi: syntax=sh ts=4 noexpandtab

@@ -7,6 +7,7 @@ import base64
 from datetime import datetime
 import getpass
 import glob
+import hashlib
 import hmac
 import json
 import os
@@ -20,6 +21,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import tornado.httpserver
+import tornado.iostream
 import tornado.web
 import tornado.websocket
 
@@ -60,9 +62,16 @@ _DAEMON_VERSION = _resolve_version()
 _pair_code: str = ""
 _pair_code_expiry: float = 0.0        # wall-clock time, for human display only
 _pair_code_mono_expiry: float = 0.0   # monotonic time, for expiry check
-_pair_attempts: int = 0
+_pair_attempts: int = 0               # wrong guesses at the current code, all sources
+_pair_attempts_by_ip: dict[str, int] = {}   # wrong guesses per source address
 _pair_paired_ip: str = ""             # IP that consumed the last code, for admin "pair_status"
-_MAX_PAIR_ATTEMPTS: int = 3
+# Wrong guesses are counted per source address so that one peer -- or one web
+# page in some browser on the tailnet -- cannot lock the real phone out by
+# burning the budget; the total cap still bounds an attacker with many
+# addresses.  3 per address and 9 overall against a million codes leaves
+# brute force at under one in a hundred thousand per pairing window.
+_MAX_PAIR_ATTEMPTS: int = 3           # per source address
+_MAX_PAIR_ATTEMPTS_TOTAL: int = 9     # across all addresses
 _PAIR_CODE_TTL: int = 60              # 60 seconds — keep the window tight
 _TOKEN_EXPIRY_DAYS: int = 90          # sessions expire after 90 days of inactivity
 _sessions: dict[str, dict] = {}      # token → {ip, paired_at, label, last_used}
@@ -153,6 +162,7 @@ def _generate_pair_code() -> str:
     _pair_code_expiry = time.time() + _PAIR_CODE_TTL
     _pair_code_mono_expiry = time.monotonic() + _PAIR_CODE_TTL
     _pair_attempts = 0
+    _pair_attempts_by_ip.clear()
     _pair_paired_ip = ""
     return _pair_code
 
@@ -372,6 +382,43 @@ def tmux_capture_pane(pane_id: str, history_lines: int = 200, ansi: bool = False
         raw = strip_ansi(raw)
     return raw
 
+# Cap how large a pane's captured window can be before _diff_pane_lines
+# skips searching and the caller falls back to a full replacement -- the
+# search below is worst-case quadratic in line count. Default
+# subscriptions ask for 300 lines (see the "lines" default in the
+# subscribe handler); this only matters for a client deliberately
+# requesting a much bigger window (up to _MAX_HISTORY_LINES).
+_MAX_DIFF_LINES = 2000
+
+def _diff_pane_lines(old_lines: list[str], new_lines: list[str]) -> tuple[int, list[str]] | None:
+    """Find the smallest number of lines to drop from the front of
+    old_lines so the remainder lines up with a prefix of new_lines --
+    i.e. the captured window just slid down by that many lines, which is
+    what a busy pane's output looks like tick to tick: old lines scroll
+    out the top, new ones appear at the bottom. Returns
+    (drop_count, appended_lines).
+
+    Always finds *some* match: dropping every line of old_lines leaves an
+    empty tail, which trivially lines up with any prefix, so the search
+    can't fail to terminate. That degenerate case (drop everything,
+    append everything) is exactly correct behavior for a change that
+    isn't a simple append -- a clear, a redraw, an in-place progress bar
+    -- so there's no separate fallback path to get wrong, just a result
+    that happens to carry the whole new pane instead of a small tail.
+
+    Returns None without searching if old_lines is too long to diff
+    cheaply (see _MAX_DIFF_LINES); the caller should send a full
+    replacement instead.
+    """
+    n = len(old_lines)
+    if n > _MAX_DIFF_LINES:
+        return None
+    for drop in range(n + 1):
+        tail = old_lines[drop:]
+        if new_lines[:len(tail)] == tail:
+            return drop, new_lines[len(tail):]
+    return n, new_lines  # unreachable: drop == n always matches above
+
 def tmux_new_session(name: str) -> None:
     _tmux("new-session", "-d", "-s", name)
 
@@ -543,13 +590,34 @@ def read_byobu_status() -> dict:
 # Tornado HTTP handlers
 # ---------------------------------------------------------------------------
 
+def _inline_script_hashes() -> list[str]:
+    """CSP source expressions for the inline <script> blocks in index.html.
+
+    Computed from the file we actually serve, so the theme bootstrap in <head>
+    is allowed to run without 'unsafe-inline' and cannot silently drift out of
+    step with the policy: any other inline script -- injected or added by
+    accident -- still has no matching hash and is blocked.
+    """
+    try:
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return ["'sha256-" + base64.b64encode(
+                hashlib.sha256(m.group(1).encode("utf-8")).digest()).decode() + "'"
+            for m in re.finditer(r"<script>(.*?)</script>", html, re.S)]
+
 _CSP = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    "script-src 'self' " + " ".join(_inline_script_hashes()) + "; "
     "style-src 'unsafe-inline'; "
     "connect-src 'self'; "
-    "img-src 'self'"
-)
+    "img-src 'self'; "
+    # These do not inherit from default-src and so must be spelled out.
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+).replace("'self' ;", "'self';")
 
 class BaseHandler(tornado.web.RequestHandler):
     """All handlers inherit this for security headers."""
@@ -662,16 +730,47 @@ class PingHandler(BaseHandler):
             self.json({"auth": False}, 401)
 
 
+def _cross_site(request) -> bool:
+    """True if a browser says this request came from another site.
+
+    /pair is the one endpoint that has no cookie to protect it, and a wrong
+    guess costs the real phone one of its attempts, so a page on any other
+    origin must not be able to submit guesses through a visitor's browser.
+    Browsers label their own requests: Sec-Fetch-Site on modern ones, Origin on
+    all of them for POST.  A request carrying neither (curl, a native client)
+    is not a browser and is let through; the cookie-free budget below still
+    bounds it.
+    """
+    site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return True
+    origin = request.headers.get("Origin", "").strip()
+    if origin and origin.lower() != "null":
+        from urllib.parse import urlparse
+        if urlparse(origin).netloc.lower() != request.host.lower():
+            return True
+    return False
+
+
 class PairHandler(BaseHandler):
     async def post(self):
         global _pair_attempts, _pair_code, _pair_code_expiry, _pair_code_mono_expiry
         global _pair_paired_ip
+        ctype = self.request.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            # A cross-site HTML form can only send the three "simple" types;
+            # requiring JSON keeps a form post from being parsed as a guess.
+            return self.json({"error": "expected application/json"}, 415)
+        if _cross_site(self.request):
+            return self.json({"error": "cross-site request refused"}, 403)
         if not _pair_code:
             return self.json({"error": "no pairing code active — run trustmux-pair"}, 403)
         if time.monotonic() > _pair_code_mono_expiry:
             _pair_code = ""
             return self.json({"error": "pairing code expired — run trustmux-pair again"}, 403)
-        if _pair_attempts >= _MAX_PAIR_ATTEMPTS:
+        ip = self.request.remote_ip  # respects xheaders automatically
+        if (_pair_attempts >= _MAX_PAIR_ATTEMPTS_TOTAL
+                or _pair_attempts_by_ip.get(ip, 0) >= _MAX_PAIR_ATTEMPTS):
             return self.json({"error": "too many attempts — run trustmux-pair again"}, 429)
         body_bytes = self.request.body
         if len(body_bytes) > 1024:
@@ -682,16 +781,20 @@ class PairHandler(BaseHandler):
             return self.json({"error": "invalid JSON"}, 400)
         if not isinstance(body, dict):
             return self.json({"error": "invalid JSON"}, 400)
-        code = re.sub(r"\D", "", body.get("code", ""))
-        if code != _pair_code:
+        code = re.sub(r"\D", "", str(body.get("code", "")))
+        if not hmac.compare_digest(code.encode(), _pair_code.encode()):
             _pair_attempts += 1
-            left = _MAX_PAIR_ATTEMPTS - _pair_attempts
+            _pair_attempts_by_ip[ip] = _pair_attempts_by_ip.get(ip, 0) + 1
+            left = min(_MAX_PAIR_ATTEMPTS - _pair_attempts_by_ip[ip],
+                       _MAX_PAIR_ATTEMPTS_TOTAL - _pair_attempts)
             await asyncio.sleep(0.5)  # slow brute-force attempts
             return self.json({"error": f"wrong code — {left} attempts left"}, 403)
         # Valid — issue permanent session token; invalidate code (one device per code)
         token = secrets.token_urlsafe(32)
-        label = self.request.headers.get("User-Agent", "")[:120]
-        ip = self.request.remote_ip  # respects xheaders automatically
+        # The label is shown on the operator's terminal by `trustmux unpair`;
+        # keep a paired device from planting escape sequences there.
+        label = re.sub(r"[^\x20-\x7e]", "?",
+                       self.request.headers.get("User-Agent", ""))[:120]
         now = time.time()
         _sessions[token] = {
             "ip": ip,
@@ -704,6 +807,7 @@ class PairHandler(BaseHandler):
         _pair_code_expiry = 0.0
         _pair_code_mono_expiry = 0.0
         _pair_attempts = 0
+        _pair_attempts_by_ip.clear()
         _pair_paired_ip = ip
         print(f"✓ Trustmux: device paired ({ip})", flush=True)
         self.set_cookie(
@@ -836,19 +940,45 @@ class WsHandler(tornado.websocket.WebSocketHandler):
         if getattr(self, "_auth_timer", None):
             self._auth_timer.cancel()
 
+    def _build_msg(self, obj: dict) -> str:
+        obj["server_ts"] = int(time.time() * 1000)
+        obj["server_tz"] = _SERVER_TZ
+        obj["server_tz_offset_s"] = int(datetime.now().astimezone().utcoffset().total_seconds())
+        obj["server_ip"] = _SERVER_IP
+        return json.dumps(obj)
+
     def _send(self, obj: dict):
         try:
-            obj["server_ts"] = int(time.time() * 1000)
-            obj["server_tz"] = _SERVER_TZ
-            obj["server_tz_offset_s"] = int(datetime.now().astimezone().utcoffset().total_seconds())
-            obj["server_ip"] = _SERVER_IP
-            self.write_message(json.dumps(obj))
+            self.write_message(self._build_msg(obj))
         except tornado.websocket.WebSocketClosedError:
+            pass
+
+    async def _send_wait(self, obj: dict):
+        # Unlike _send, this awaits the write actually draining before
+        # returning. The three streaming loops below (topology poll, pane
+        # snapshot/update) each re-fetch and re-send full state on a fixed
+        # tick with no idea whether the client has caught up -- with a
+        # fire-and-forget _send, a client slower than the tick rate (a
+        # high-latency phone connection) never applies backpressure, so
+        # every tick's full repaint keeps queuing in the kernel socket
+        # buffer behind whatever hasn't drained yet. Measured on a real
+        # connection: this grew to 2.6MB of queued, already-stale pane
+        # updates, which a fresh pane-switch snapshot then had to wait
+        # behind -- explaining reports of context switches taking tens of
+        # seconds on slow links despite the daemon responding instantly.
+        # Awaiting here means a slow client simply pauses the loop instead
+        # of piling more full repaints behind an undelivered one, bounding
+        # the worst-case backlog to a single in-flight message.
+        try:
+            fut = self.write_message(self._build_msg(obj))
+            if fut is not None:
+                await fut
+        except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
             pass
 
     async def _send_sessions(self):
         sessions = await asyncio.to_thread(tmux_list_sessions)
-        self._send({"type": "sessions", "data": sessions})
+        await self._send_wait({"type": "sessions", "data": sessions})
 
     async def _poll_topology(self):
         try:
@@ -863,7 +993,7 @@ class WsHandler(tornado.websocket.WebSocketHandler):
                 key = json.dumps(sessions, sort_keys=True)
                 if key != last:
                     last = key
-                    self._send({"type": "sessions", "data": sessions})
+                    await self._send_wait({"type": "sessions", "data": sessions})
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -873,14 +1003,28 @@ class WsHandler(tornado.websocket.WebSocketHandler):
                            join: bool = False):
         try:
             content = await asyncio.to_thread(tmux_capture_pane, pane_id, history_lines, ansi, join)
-            self._send({"type": "snapshot", "pane_id": pane_id, "data": content})
+            await self._send_wait({"type": "snapshot", "pane_id": pane_id, "data": content})
             last = content
+            last_lines = content.split("\n")
             while True:
                 await asyncio.sleep(0.5)
                 content = await asyncio.to_thread(tmux_capture_pane, pane_id, history_lines, ansi, join)
                 if content != last:
-                    self._send({"type": "update", "pane_id": pane_id, "data": content})
+                    new_lines = content.split("\n")
+                    diff = _diff_pane_lines(last_lines, new_lines)
+                    if diff is not None:
+                        drop, appended = diff
+                        # A pure top-drop/bottom-append -- the common case
+                        # for a scrolling pane -- costs only the new
+                        # lines instead of the whole captured window.
+                        await self._send_wait({
+                            "type": "delta", "pane_id": pane_id,
+                            "drop": drop, "append": appended,
+                        })
+                    else:
+                        await self._send_wait({"type": "update", "pane_id": pane_id, "data": content})
                     last = content
+                    last_lines = new_lines
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1123,6 +1267,7 @@ async def _handle_admin(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "port":      _listen.get("port", 0),
                 "scheme":    _listen.get("scheme", ""),
                 "advertise": _listen.get("advertise", []),
+                "fingerprint": _cert_fingerprint,
             }
 
         elif action == "pair_generate":
@@ -1242,13 +1387,37 @@ def _make_app() -> tornado.web.Application:
 # Entry point
 # ---------------------------------------------------------------------------
 
+_cert_fingerprint: str = ""   # SHA-256 of the served certificate, for `status`
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Create path with mode 0600 from the first byte; never chmod-after."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
+
+
 def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tuple:
-    """Generate a self-signed TLS cert for lan_ip. Returns (cert_path, ssl_ctx).
+    """Return (cert_path, ssl_ctx) for a self-signed cert covering lan_ip.
 
     advertised are hosts this daemon was told to publish.  They have to be in
     here: a browser refuses a certificate that omits the name in the URL bar
     outright, rather than offering the click-through a self-signed one gets, so
     advertising an address without certifying it would be worse than useless.
+
+    The keypair is kept across restarts.  A certificate that changed on every
+    start would train the user to click through a fresh warning each time, and
+    a man in the middle presenting his own certificate would then look exactly
+    like a restart.  Keeping it lets a browser's "accept this certificate"
+    exception stick, and lets `trustmux status` print a fingerprint the user
+    can compare.  Only the certificate is reissued when the names it must
+    cover change; the key is reused so the fingerprint of the key does not.
     """
     import ssl as _ssl
     import ipaddress as _ipaddress
@@ -1258,9 +1427,13 @@ def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tup
     from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
     from cryptography.hazmat.primitives.asymmetric import ec as _ec
 
+    global _cert_fingerprint
     cert = CERT_FILE
     key  = KEY_FILE
+    # Re-assert 0700 rather than trust a pre-existing directory's mode: the
+    # private key is about to be written into it.
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
     san_parts = [f"IP:{lan_ip}", "IP:127.0.0.1", "DNS:localhost"]
     fqdn = socket.getfqdn()
     if fqdn and fqdn not in ("localhost", lan_ip):
@@ -1281,8 +1454,50 @@ def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tup
     # An advertised host is often one of these already (the fqdn, say), and a
     # duplicated SAN is legal but pointless.
     san_parts = list(dict.fromkeys(san_parts))
+    now = _datetime.datetime.now(_datetime.timezone.utc)
+
+    def _fingerprint(c) -> str:
+        return c.fingerprint(_hashes.SHA256()).hex(":").upper()
+
+    def _ctx():
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(str(cert), str(key))
+        return ctx
+
+    private_key = None
+    if key.exists() and cert.exists():
+        try:
+            private_key = _ser.load_pem_private_key(key.read_bytes(), password=None)
+            existing = _x509.load_pem_x509_certificate(cert.read_bytes())
+            san = existing.extensions.get_extension_for_class(
+                _x509.SubjectAlternativeName).value
+            have = ({f"DNS:{n}" for n in san.get_values_for_type(_x509.DNSName)}
+                    | {f"IP:{ip}" for ip in san.get_values_for_type(_x509.IPAddress)})
+            not_after = getattr(existing, "not_valid_after_utc", None) \
+                or existing.not_valid_after.replace(tzinfo=_datetime.timezone.utc)
+            same_key = (existing.public_key().public_bytes(
+                            _ser.Encoding.DER, _ser.PublicFormat.SubjectPublicKeyInfo)
+                        == private_key.public_key().public_bytes(
+                            _ser.Encoding.DER, _ser.PublicFormat.SubjectPublicKeyInfo))
+            if (same_key and set(san_parts) <= have
+                    and not_after > now + _datetime.timedelta(days=30)):
+                _cert_fingerprint = _fingerprint(existing)
+                # The key may predate _write_private; make sure of its mode.
+                key.chmod(0o600)
+                print(f"Trustmux: reusing TLS certificate {cert} "
+                      f"(SHA-256 {_cert_fingerprint})", flush=True)
+                return cert, _ctx()
+            print("Trustmux: TLS certificate no longer covers every name; "
+                  "reissuing with the same key", flush=True)
+        except Exception as e:
+            print(f"Trustmux: cannot reuse existing TLS keypair ({e}); "
+                  "generating a new one", flush=True)
+            private_key = None
+
     try:
-        private_key = _ec.generate_private_key(_ec.SECP256R1())
+        if private_key is None:
+            private_key = _ec.generate_private_key(_ec.SECP256R1())
         san_list = []
         for part in san_parts:
             if part.startswith("IP:"):
@@ -1292,7 +1507,6 @@ def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tup
         subject = issuer = _x509.Name([
             _x509.NameAttribute(_NameOID.COMMON_NAME, "trustmux"),
         ])
-        now = _datetime.datetime.now(_datetime.timezone.utc)
         cert_obj = (
             _x509.CertificateBuilder()
             .subject_name(subject)
@@ -1304,24 +1518,22 @@ def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tup
             .add_extension(_x509.SubjectAlternativeName(san_list), critical=False)
             .sign(private_key, _hashes.SHA256())
         )
-        key.write_bytes(private_key.private_bytes(
+        _write_private(key, private_key.private_bytes(
             encoding=_ser.Encoding.PEM,
             format=_ser.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=_ser.NoEncryption(),
         ))
         cert.write_bytes(cert_obj.public_bytes(_ser.Encoding.PEM))
         cert.chmod(0o644)
-        key.chmod(0o600)
+        _cert_fingerprint = _fingerprint(cert_obj)
     except Exception as e:
         print(f"Error: TLS cert generation failed ({e})", flush=True)
         print(f"Trustmux refuses to start without encryption. Install 'cryptography': {sys.executable} -m pip install --upgrade cryptography", flush=True)
         sys.exit(1)
-    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = _ssl.TLSVersion.TLSv1_3
-    ctx.load_cert_chain(str(cert), str(key))
     named = ", ".join(dict.fromkeys([lan_ip, *advertised]))
-    print(f"Trustmux: self-signed TLS cert generated for {named}", flush=True)
-    return cert, ctx
+    print(f"Trustmux: self-signed TLS cert generated for {named} "
+          f"(SHA-256 {_cert_fingerprint})", flush=True)
+    return cert, _ctx()
 
 
 async def _amain(host: str, port: int, https: bool, ssl_ctx=None,

@@ -910,6 +910,69 @@ assert_true "osc133 bash: chains onto an existing PS1 rather than replacing it" 
 
 unset PS1 PROMPT_COMMAND PS0 rendered expected out want prompt_command_before ps1_before
 
+# Hyperlink-aware `ls` alias, coupled to this same shell-integration.bash --
+# see that file's tail for the rationale. Uses a fake `ls` on PATH rather
+# than the real one so both the "supports --hyperlink" and "doesn't" paths
+# are exercised deterministically, regardless of which coreutils version
+# actually happens to be installed on whatever machine runs this suite.
+# Each case runs in its own `bash -c` subshell (matching how Section 40
+# below isolates zsh) so alias/PATH state from one case can't leak into the
+# next, and so this doesn't disturb PS1/PROMPT_COMMAND/PS0 left set above.
+
+_fakebin=$(mktemp -d)
+cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) exit 0 ;;
+esac
+exec /bin/ls "$@"
+EOF
+chmod +x "$_fakebin/ls"
+
+# Each case reports an explicit sentinel ("ALIAS:<value>" or "NO_ALIAS")
+# rather than being scraped from `alias ls`'s own builtin output -- bash
+# prints a "not found"-style message to stderr for a missing alias, but
+# zsh's equivalent prints nothing at all (just a nonzero exit), so parsing
+# builtin wording is not portable between the two shells this same test
+# also has to cover below.
+_out=$(bash -c '
+	unalias ls 2>/dev/null
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: ls aliased with --hyperlink=auto when ls supports it and isn't already aliased" \
+	"printf %s \"\$_out\" | grep -q -- '--hyperlink=auto'"
+
+_out=$(bash -c '
+	alias ls="ls -F"
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: a pre-existing ls alias is left untouched, not overridden" \
+	"[ \"\$_out\" = \"ALIAS:alias ls='ls -F'\" ]"
+
+cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) echo "ls: unrecognized option '--hyperlink=auto'" >&2; exit 2 ;;
+esac
+exec /bin/ls "$@"
+EOF
+chmod +x "$_fakebin/ls"
+
+_out=$(bash -c '
+	unalias ls 2>/dev/null
+	export PATH="'"$_fakebin"':$PATH"
+	source "'"$BYOBU_PREFIX"'/share/byobu/profiles/shell-integration.bash"
+	if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+' 2>&1)
+assert_true "osc133 bash: no alias set when ls does not understand --hyperlink" \
+	"[ \"\$_out\" = NO_ALIAS ]"
+
+rm -rf "$_fakebin"; unset _fakebin _out
+
 # ---------------------------------------------------------------------------
 # Section 40 — OSC 133 shell integration (profiles/shell-integration.zsh)
 # ---------------------------------------------------------------------------
@@ -955,6 +1018,60 @@ if command -v zsh >/dev/null 2>&1; then
 		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PRECMD_OK"
 	assert_true "osc133 zsh: re-sourcing does not duplicate the PROMPT marker" \
 		"printf %s \"\$_zsh_out\" | grep -q IDEMPOTENT_PROMPT_OK"
+
+	# Hyperlink-aware `ls` alias -- zsh counterpart to the bash cases above.
+	# Same fake-ls-on-PATH technique, for the same reason: deterministic
+	# regardless of the host's actual coreutils version.
+	_fakebin=$(mktemp -d)
+	cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) exit 0 ;;
+esac
+exec /bin/ls "$@"
+EOF
+	chmod +x "$_fakebin/ls"
+
+	# Explicit sentinels, not scraped `alias ls` wording -- see the bash
+	# cases above for why: zsh's own message (or total silence) for a
+	# missing alias isn't the same as bash's.
+	_zsh_out=$(zsh -c '
+		unalias ls 2>/dev/null
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: ls aliased with --hyperlink=auto when ls supports it and isn't already aliased" \
+		"printf %s \"\$_zsh_out\" | grep -q -- '--hyperlink=auto'"
+
+	_zsh_out=$(zsh -c '
+		alias ls="ls -F"
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: a pre-existing ls alias is left untouched, not overridden" \
+		"printf %s \"\$_zsh_out\" | grep -q 'ls -F'"
+
+	cat > "$_fakebin/ls" <<'EOF'
+#!/bin/sh
+case "$*" in
+	*--hyperlink*) echo "ls: unrecognized option '--hyperlink=auto'" >&2; exit 2 ;;
+esac
+exec /bin/ls "$@"
+EOF
+	chmod +x "$_fakebin/ls"
+
+	_zsh_out=$(zsh -c '
+		unalias ls 2>/dev/null
+		export PATH="'"$_fakebin"':$PATH"
+		source "'"$_zsh_script"'"
+		if alias ls >/dev/null 2>&1; then echo "ALIAS:$(alias ls)"; else echo "NO_ALIAS"; fi
+	' 2>&1)
+	assert_true "osc133 zsh: no alias set when ls does not understand --hyperlink" \
+		"[ \"\$_zsh_out\" = NO_ALIAS ]"
+
+	rm -rf "$_fakebin"; unset _fakebin
 
 	unset _zsh_script _zsh_out
 else
@@ -1026,6 +1143,169 @@ else
 fi
 
 unset _enable_src _disable_src _marker
+
+# ---------------------------------------------------------------------------
+# Section 42 — security regressions (2026-09 audit)
+# ---------------------------------------------------------------------------
+
+# battery: /sys uevent is parsed, never sourced.  A USB HID battery/UPS can
+# put arbitrary bytes in MODEL_NAME/SERIAL_NUMBER, which used to be sourced
+# as shell.  Point $BATTERY at a hostile fake and make sure nothing runs.
+_bat_tmp=$(mktemp -d)
+_bat_marker="$_bat_tmp/pwned"
+mkdir -p "$_bat_tmp/BAT9"
+cat > "$_bat_tmp/BAT9/uevent" <<EOF
+POWER_SUPPLY_NAME=BAT9
+POWER_SUPPLY_TYPE=Battery
+POWER_SUPPLY_STATUS=Discharging
+POWER_SUPPLY_PRESENT=1
+POWER_SUPPLY_MODEL_NAME=\$(touch $_bat_marker)
+POWER_SUPPLY_SERIAL_NUMBER="; touch $_bat_marker.2; "
+POWER_SUPPLY_MANUFACTURER=\`touch $_bat_marker.3\`
+POWER_SUPPLY_CAPACITY=42
+POWER_SUPPLY_CHARGE_NOW=42; touch $_bat_marker.4
+EOF
+_bat_out=$(
+	BATTERY="$_bat_tmp/BAT9" BYOBU_OSTYPE=Linux BYOBU_CHARMAP=UTF-8
+	export BATTERY BYOBU_OSTYPE BYOBU_CHARMAP
+	# The real host's /sys batteries are still globbed; the fake one is
+	# processed first, and on a host without a battery it is the only one.
+	. "${BYOBU_PREFIX}/lib/${PKG}/battery"
+	__battery 2>/dev/null
+)
+assert_false "battery: \$(...) in MODEL_NAME does not execute" "[ -e '$_bat_marker' ]"
+assert_false "battery: quote-breakout in SERIAL_NUMBER does not execute" "[ -e '$_bat_marker.2' ]"
+assert_false "battery: backticks in MANUFACTURER do not execute" "[ -e '$_bat_marker.3' ]"
+assert_false "battery: non-numeric CHARGE_NOW is rejected, not executed" "[ -e '$_bat_marker.4' ]"
+assert_true  "battery: sane keys from the same uevent are still used" \
+	"printf '%s' \"$_bat_out\" | grep -q '42'"
+assert_true  "battery: no 'source' of uevent remains in the script" \
+	"! grep -q 'uevent.*>.*TMP_FILE' '${BYOBU_PREFIX}/lib/${PKG}/battery'"
+rm -rf "$_bat_tmp"; unset _bat_tmp _bat_marker _bat_out
+
+# select-session.py: user input must never be eval()'d (restricted-shell escape)
+_sel="${BYOBU_PREFIX}/lib/${PKG}/include/select-session.py"
+assert_false "select-session.py: no eval() of user input" "grep -v '^[[:space:]]*#' '$_sel' | grep -q 'eval('"
+unset _sel
+
+# manifest: only Debian package names may reach 'sudo apt install'
+_man="${BYOBU_PREFIX}/bin/manifest"
+_man_tmp=$(mktemp -d)
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_man_tmp/col2"
+_man_out=$(
+	PATH="$_man_tmp:$PATH"
+	# Pull filter_packages() out of the script without running it.
+	eval "$(sed -n '/^filter_packages() {/,/^}/p' "$_man")"
+	printf 'ii  bash  5.2  amd64  shell\nii  -oDPkg::Pre-Invoke::=id  1  all  x\nii  ../evil  1  all  x\nii  Libfoo  1  all  x\nii  zsh  5.9  amd64  shell\n' | filter_packages | tr '\n' ' '
+)
+assert_eq "manifest: option-like and malformed names are dropped" "$_man_out" "bash zsh "
+assert_true "manifest: apt invoked with -- before the package list" "grep -q 'apt install -- ' '$_man'"
+assert_false "manifest: no plaintext http:// default remains" "grep -q 'http://paste' '$_man'"
+rm -rf "$_man_tmp"; unset _man _man_tmp _man_out
+
+# printf_status: "#" from data must reach tmux doubled, screen untouched
+out=$(BYOBU_BACKEND=tmux printf_status 'host#(id)#{pane_current_path}#[fg=red]x')
+assert_eq "printf_status tmux: every # doubled" "$out" 'host##(id)##{pane_current_path}##[fg=red]x'
+out=$(BYOBU_BACKEND=tmux printf_status '###')
+assert_eq "printf_status tmux: run of #" "$out" '######'
+out=$(BYOBU_BACKEND=tmux printf_status 'plain')
+assert_eq "printf_status tmux: no # is a no-op" "$out" 'plain'
+out=$(BYOBU_BACKEND=screen printf_status 'a#b')
+assert_eq "printf_status screen: literal" "$out" 'a#b'
+for _f in hostname release distro whoami; do
+	assert_true "status/$_f: emits via printf_status" \
+		"grep -q 'printf_status' '${BYOBU_PREFIX}/lib/${PKG}/$_f'"
+done
+unset _f
+
+# byobu-ulevel: option values are numbers or nothing (they reach bc and eval).
+# Section 17's temp copy is gone by now (rm'd once its own tests finished) --
+# build a fresh one the same way it did: @prefix@-substituted .in from the
+# source tree, or the real installed binary when .in isn't shipped (an
+# installed package never ships .in templates, only their substituted
+# output). Getting this wrong doesn't just fail the assert_true checks
+# below -- the assert_false ones (hostile input must be *rejected*) would
+# silently pass for the wrong reason too, since "no such file" is also a
+# nonzero exit, masking whether the actual validation logic ever ran.
+_ul_bin=$(mktemp /tmp/byobu-ulevel-test-42-XXXXXX)
+sed "s|@prefix@|${BYOBU_PREFIX}|g" \
+	"${BYOBU_PREFIX}/../usr/bin/byobu-ulevel.in" > "$_ul_bin" 2>/dev/null || \
+sed "s|@prefix@|${BYOBU_PREFIX}|g" \
+	"$(dirname "$0")/../../bin/byobu-ulevel.in" > "$_ul_bin" 2>/dev/null || \
+cp "${BYOBU_PREFIX}/bin/byobu-ulevel" "$_ul_bin" 2>/dev/null || true
+chmod +x "$_ul_bin"
+_ul() { BYOBU_INCLUDED_LIBS=1 BYOBU_BACKEND=tmux PKG=byobu bash "$_ul_bin" "$@"; }
+assert_true "ulevel: numeric -c accepted" "_ul -c 50 >/dev/null 2>&1"
+assert_false "ulevel: -c with bc code is refused" "_ul -c 'x; print 1' >/dev/null 2>&1"
+assert_false "ulevel: -m with shell text is refused" "_ul -c 5 -m '\$(id)' >/dev/null 2>&1"
+assert_false "ulevel: -x non-numeric is refused" "_ul -c 5 -x 10abc >/dev/null 2>&1"
+assert_false "ulevel: -w non-numeric is refused" "_ul -c 5 -w '3 3' >/dev/null 2>&1"
+out=$(_ul -c 5 -m -10 -x 10.5 -w 4 2>/dev/null)
+assert_nonempty "ulevel: negative and decimal bounds still accepted" "$out"
+out=$(_ul -c 50 -u 'a b c' 2>/dev/null)
+assert_nonempty "ulevel: user theme via -u still renders" "$out"
+_ul_tmp=$(mktemp -d)
+_ul -c 50 -u 'a $(touch '"$_ul_tmp"'/pwned) c' >/dev/null 2>&1 || true
+assert_false "ulevel: user theme glyphs are not eval'd" "[ -e '$_ul_tmp/pwned' ]"
+rm -rf "$_ul_tmp"; unset _ul_tmp
+assert_false "ulevel: theme name is matched exactly, not as a regex" "_ul -c 5 -t 'vbars_[8]' >/dev/null 2>&1"
+rm -f "$_ul_bin"; unset _ul_bin
+
+# col1: column number comes from argv[0] and is data to awk, not program text
+_col_tmp=$(mktemp -d)
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_col_tmp/col3"
+_col_evil='col1);system("touch pwned");{print(1'
+ln -s "${BYOBU_PREFIX}/bin/col1" "$_col_tmp/$_col_evil"
+out=$(printf 'a b c d\n' | "$_col_tmp/col3")
+assert_eq "col3: prints third column" "$out" "c"
+out=$(printf 'a:b:c\n' | "$_col_tmp/col3" :)
+assert_eq "col3 with separator" "$out" "c"
+assert_true "colN: hostile argv[0] is a usage error" "[ -L '$_col_tmp/$_col_evil' ] && ! (cd '$_col_tmp' && printf 'a b\n' | ./\"\$_col_evil\" >/dev/null 2>&1)"
+(cd "$_col_tmp" && printf 'a b\n' | "./$_col_evil" >/dev/null 2>&1) || true
+assert_false "colN: hostile argv[0] does not reach awk program text" "[ -e '$_col_tmp/pwned' ]"
+unset _col_evil
+rm -rf "$_col_tmp"; unset _col_tmp
+
+# Static checks on scripts that need a live tmux or network to run.
+# byobu-ugraph/byobu-layout are .in templates -- absent by design from an
+# installed package (only their @prefix@-substituted output ships), so
+# check that instead when .in isn't found. This isn't just cosmetic for
+# the assert_true below: the assert_false checks would otherwise "pass"
+# against a missing file for the wrong reason (no match is also true of
+# no file), silently verifying nothing in that environment.
+_resolve_or_installed() {
+	# $1: script base name (no .in). Echoes whichever exists.
+	local f="${BYOBU_PREFIX}/bin/$1.in"
+	[ -r "$f" ] || f="${BYOBU_PREFIX}/bin/$1"
+	# Nix wraps an installed binary in a thin launcher (PATH/BYOBU_PYTHON
+	# setup) that execs the real script renamed to a leading-dot file in
+	# the same directory -- confirmed directly against a real Nix build:
+	# /nix/store/.../bin/byobu-layout is 638 bytes of wrapper with none of
+	# the real logic text, while .../bin/.byobu-layout (4KB) has it. A
+	# content grep against the wrapper finds nothing either way, so
+	# assert_false "passes" for the wrong reason and assert_true fails
+	# outright -- follow the wrapper's own exec line to the real file.
+	if grep -q 'exec -a ' "$f" 2>/dev/null; then
+		local real
+		real=$(sed -n 's/.*exec -a "[^"]*" "\([^"]*\)".*/\1/p' "$f" | head -1)
+		[ -n "$real" ] && [ -r "$real" ] && f="$real"
+	fi
+	printf '%s' "$f"
+}
+_ugraph=$(_resolve_or_installed byobu-ugraph)
+_layout=$(_resolve_or_installed byobu-layout)
+assert_false "byobu-ugraph: no predictable /tmp file" "grep -q 'file=/tmp/\${USER}' '$_ugraph'"
+assert_false "byobu-ugraph: no eval of the command" "grep -q 'eval \"\$cmd' '$_ugraph'"
+assert_true  "byobu-layout: validates layout names" "grep -q 'valid_name \"\$name\"' '$_layout'"
+assert_false "byobu-layout: no printf with data as format" "grep -q 'printf \"\$panes' '$_layout'"
+unset -f _resolve_or_installed
+unset _ugraph _layout
+assert_true  "wifi-status: validates interface name" "grep -q 'invalid wireless interface name' '${BYOBU_PREFIX}/bin/wifi-status'"
+assert_true  "wifi-status: validates ping target" "grep -q 'invalid WIFI_PING_TARGET' '${BYOBU_PREFIX}/bin/wifi-status'"
+assert_true  "whats-my-public-ip: https only" "! grep -q 'http://' '${BYOBU_PREFIX}/bin/whats-my-public-ip'"
+assert_true  "purge-old-kernels: quotes \$@" "grep -q 'apt-get \"\$@\" autoremove' '${BYOBU_PREFIX}/bin/purge-old-kernels'"
+assert_false "byobu-ctrl-a: stray character after keybindings path removed" "grep -q '\"\$keybindings\"e' '${BYOBU_PREFIX}/bin/byobu-ctrl-a.in'"
+assert_false "updates_available: cache path not spliced into sh -c" "grep -q 'sh -c \".*mycache' '${BYOBU_PREFIX}/lib/${PKG}/updates_available'"
 
 # ---------------------------------------------------------------------------
 # Results

@@ -1,5 +1,6 @@
 """trustmux-unpair — list and remove paired devices."""
 import json
+import re
 import socket
 import sys
 
@@ -44,7 +45,9 @@ def _ua_short(label: str) -> str:
     for keyword in ("Mobile", "Chrome", "Firefox", "Safari"):
         if keyword in label:
             return keyword
-    return label[:30]
+    # The label was chosen by the device that paired; the daemon now strips it
+    # to printable ASCII, but tokens.json may predate that.
+    return re.sub(r"[^\x20-\x7e]", "?", label)[:30]
 
 
 def main(inst: Instance | None = None):

@@ -30,4 +30,4 @@ echo "WARNING: purge-old-kernels is deprecated and will be removed in a future r
 echo "         Use 'sudo apt autoremove' instead to remove old kernel packages." >&2
 echo "" >&2
 
-sudo apt-get $@ autoremove
+sudo apt-get "$@" autoremove

@@ -21,10 +21,14 @@
 # start/end+exit-code) so terminals and tools that understand them --
 # iTerm2, Kitty, Ghostty, VS Code, Warp, and Trustmux's own daemon -- can
 # locate prompts and command boundaries precisely instead of guessing from
-# rendered text. See usr/share/byobu/profiles/shell-integration.{bash,zsh}
-# for the marker reference. Opt-in: does not touch shells this wasn't asked
-# to run on, and layers onto whatever prompt setup (byobu's own colorized
-# one, oh-my-zsh, starship, plain) is already there rather than replacing it.
+# rendered text. Also aliases `ls` to emit OSC 8 hyperlinks, which Trustmux
+# (and any other OSC-8-aware terminal) renders as clickable -- bundled into
+# this same toggle for now, rather than a separate opt-in. See
+# usr/share/byobu/profiles/shell-integration.{bash,zsh} for the OSC 133
+# marker reference and the hyperlink-alias guards. Opt-in: does not touch
+# shells this wasn't asked to run on, and layers onto whatever prompt setup
+# (byobu's own colorized one, oh-my-zsh, starship, plain) is already there
+# rather than replacing it.
 
 PKG="byobu"
 [ -r "$HOME/.byoburc" ] && . "$HOME/.byoburc"

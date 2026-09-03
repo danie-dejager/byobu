@@ -57,9 +57,9 @@ __release() {
 		RELEASE=$(lsb_release -s -r)
 	fi
 	if [ -n "$RELEASE_ABBREVIATED" ] && [ $RELEASE_ABBREVIATED -gt 0 ]; then
-		color bold2; printf "%.${RELEASE_ABBREVIATED}s" "$RELEASE"; color --
+		color bold2; printf_status "$(printf "%.${RELEASE_ABBREVIATED}s" "$RELEASE")"; color --
 	else
-		color bold2; printf "%s" "$RELEASE"; color --
+		color bold2; printf_status "$RELEASE"; color --
 	fi
 }
 

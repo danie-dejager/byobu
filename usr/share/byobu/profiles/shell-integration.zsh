@@ -16,11 +16,12 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # zsh counterpart to shell-integration.bash -- see that file for the OSC 133
-# marker reference and rationale. zsh's native precmd/preexec hook arrays
-# make this simpler than bash's PROMPT_COMMAND/PS0 juggling: no risk of
-# reordering someone else's chained PROMPT_COMMAND string, just an array
-# entry each, and $? is still the last command's exit status when a precmd
-# function runs, same as bash.
+# marker reference and rationale, and for the hyperlink-aware `ls` alias
+# rationale (coupled to this same toggle for now). zsh's native
+# precmd/preexec hook arrays make this simpler than bash's
+# PROMPT_COMMAND/PS0 juggling: no risk of reordering someone else's chained
+# PROMPT_COMMAND string, just an array entry each, and $? is still the last
+# command's exit status when a precmd function runs, same as bash.
 
 __byobu_osc133_precmd() {
 	local _exit=$?
@@ -49,5 +50,10 @@ case "$PROMPT" in
 	*) PROMPT="${PROMPT}%{${__byobu_osc133_b}%}" ;;
 esac
 unset __byobu_osc133_b
+
+# Hyperlink-aware `ls` -- see shell-integration.bash for the full rationale.
+if ! alias ls >/dev/null 2>&1 && ls --hyperlink=auto . >/dev/null 2>&1; then
+	alias ls='ls --color=auto --hyperlink=auto'
+fi
 
 # vi: syntax=sh ts=4 noexpandtab

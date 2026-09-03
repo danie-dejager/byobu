@@ -18,6 +18,103 @@ lost, just relocated to where all distributions can use it.
 
 byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
 
+  * mobile: security: raise the tornado floor to 6.5.8, closing three
+    Dependabot advisories: GHSA-mpf4-983q-p7j4 (high -- urlencoded body
+    parsing omits max_num_fields, can stall the event loop),
+    GHSA-8423-8fgw-73vq (medium -- multipart parsing builds an unbounded
+    temp list before checking max_parts, memory-amplification DoS), and
+    GHSA-wwv5-g3v4-889x (low -- incomplete fix for an earlier cookie-
+    attribute-injection CVE). mobile/uv.lock and mobile/requirements.txt
+    regenerated to match; homebrew/Formula/trustmux.rb's separately
+    pinned tornado resource updated too, since it drifts independently
+    of pyproject.toml/uv.lock and Dependabot doesn't parse Ruby resource
+    blocks (the exact class of gap release.py's
+    check_homebrew_resources_fresh() exists to catch)
+  * usr/bin/tmpfsffs: removed. Never actually shipped in any package
+    (missing from dist_bin_SCRIPTS since it was added) and was always a
+    proof-of-concept, not a real part of byobu -- rather than fix its
+    packaging, drop it entirely
+  * usr/share/byobu/tests/test_byobu.sh: fix Section 42's ulevel/ugraph/
+    layout checks to fall back to the installed script when the .in
+    source template isn't present (an installed package never ships
+    .in files, only their substituted output). These hardcoded the .in
+    path directly, so every one of them was silently exercising nothing
+    against an installed package -- a missing file satisfies "no such
+    pattern found" just as well as an absent pattern does, so the
+    assert_false checks "passed" for the wrong reason and the assert_true
+    ones failed outright. Verified against a real dpkg-buildpackage
+    build + install (not just source-tree): 225 passing, was 220 passed
+    / 5 failed
+  * rpm/byobu.spec: add whats-my-public-ip to %files -- unlike Debian's
+    dh_auto_install, rpmbuild fails the whole build if anything make
+    install actually installs isn't explicitly listed, which is exactly
+    what surfaced once whats-my-public-ip started actually being
+    installed. Verified against a real rpmbuild + dnf install round
+    trip: 223 passing, 0 failed
+  * usr/bin/Makefile.am: install whats-my-public-ip -- like tmpfsffs, it
+    has been missing from dist_bin_SCRIPTS since it was added and so
+    never actually shipped in any package. Its own new test masked this
+    as a false pass rather than a failure (a negated assert_true against
+    a missing file is trivially true), which is why it went unnoticed
+    until checked directly against a real build
+  * usr/share/byobu/tests/test_byobu.sh: the ulevel/ugraph/layout
+    install-fallback fix above still failed once packaged with Nix
+    specifically: nixpkgs wraps these particular binaries in a thin
+    launcher (PATH/BYOBU_PYTHON setup) that execs the real script
+    renamed to a leading-dot file in the same directory, so a content
+    grep against the installed path hit the wrapper, not the real
+    logic -- same masking problem, one layer deeper. Fixed by following
+    the wrapper's own exec line to the real file when present. Verified
+    against a real `nix-build` of this source tree (not just Debian):
+    223 passing, was 222 passed / 1 failed
+  * security: fixes from the 2026-09 security audit (CVE requests pending
+    for the first three; a fourth, in tmpfsffs, no longer applies now
+    that tmpfsffs has been removed rather than fixed -- see above)
+    - manifest: validate package names and pass "--" before them; a
+      pastebin or file listing could put apt options such as
+      -oDPkg::Pre-Invoke::= on a "sudo apt install" command line (root
+      command execution); URL import is now https-only and confirms
+    - battery: parse /sys uevent instead of sourcing it as shell; a USB
+      HID battery/UPS with a crafted model or serial string could run
+      code as the user on every status refresh
+    - select-session.py: remove eval() of the session-chooser answer, a
+      restricted-shell (ForceCommand/rbash/kiosk) escape
+    - trustmux: "stop"/"disable"/"rm" remove the tailscale serve mapping
+      they created and "status" warns while one points at nothing; in
+      serve mode the daemon is plain HTTP on 127.0.0.1, and a mapping
+      left behind let another local user bind the port and receive the
+      phone's session cookie
+    - trustmux: keep the start-direct TLS keypair across restarts and
+      print its SHA-256 fingerprint in "status", instead of a new
+      certificate (and a new browser warning) on every start
+    - trustmux: /pair refuses cross-site browser requests and non-JSON
+      bodies, and counts wrong guesses per source address (3) with a total
+      cap (9), so one peer cannot lock the real phone out
+    - trustmux: instance config file is opened O_NOFOLLOW and must be a
+      regular file owned by the user with non-writable parents (it can
+      name a program the daemon runs); instance names are matched with
+      fullmatch; ~/.profile edits are atomic; the pairing User-Agent is
+      stripped to printable ASCII
+    - trustmux/pwa: allow the inline theme script by CSP hash (it was
+      silently blocked) and add object-src/base-uri/form-action/
+      frame-ancestors; fix the service worker's dead cache logic; drop the
+      pairing code from the URL as soon as it is read; show OSC 8 link
+      targets on long-press
+    - status scripts escape "#" for tmux (hostname, release, distro,
+      whoami) so data cannot reach tmux's format engine; byobu-ugraph uses
+      mktemp and no eval; byobu-ulevel checks numeric options and no longer
+      evals user themes; wifi-status, byobu-layout, col1, byobu-quiet,
+      whats-my-public-ip, purge-old-kernels, updates_available and
+      include/dirs hardened; byobu-ctrl-a stray-character bug fixed
+    - release.py: build output, tap clones and tarballs live under
+      ~/.cache/byobu-release (0700) instead of predictable /tmp paths;
+      .orig.tar.gz is verified against git archive HEAD and the .dsc
+      before signing; signing always asks; salsa/debian/latest changes
+      since the last signed release are shown; urlopen timeouts
+    - GitHub Actions pinned by commit SHA; workflow_dispatch version goes
+      through env and is validated; PyPI attestations enabled
+    - experimental/byobu-classroom: random guest password, sshd changes
+      confined to the Match block, user names validated
   * trustmux/pwa: add opt-in OSC 133 shell integration
     (byobu-enable-shell-integration / byobu-disable-shell-integration) --
     prompt/command boundary markers for Trustmux's own future prompt
@@ -29,6 +126,51 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
   * trustmux/pwa: the $_/Aa/** keyboard-mode button now opens a popup
     showing all three choices, matching the existing ⎋ button, instead of
     cycling one tap at a time
+  * trustmux/pwa: raise the connection-info popup's latency-ping timeout
+    from 3s to 60s, so a real but high-latency or backed-up link (e.g.
+    plane wifi) shows an actual number instead of "timed out"
+  * trustmux/pwa: tapping the logo/wordmark now opens a short "about"
+    popup (what Trustmux is, link to trustmux.dev; credit and LinkedIn
+    link for Dustin Kirkland) instead of navigating away to trustmux.dev
+  * trustmux daemon: fix a real backpressure bug where a client slower
+    than the 0.5s pane-poll tick (a high-latency phone connection) never
+    throttled the daemon's full-repaint sends -- observed live, this let
+    2.6MB of stale, already-superseded pane updates queue up in the
+    kernel socket buffer, which a fresh pane-switch snapshot then had to
+    wait behind on the same ordered stream. Explains reports of context
+    switches taking many seconds to tens of seconds on slow links (LTE,
+    plane wifi) despite the daemon itself responding instantly
+  * trustmux daemon: stream pane updates as a delta (lines dropped off
+    the top, lines appended at the bottom) instead of re-sending the
+    whole captured window on every tick. A busy pane's content usually
+    just scrolls -- a few new lines at the bottom -- so most updates now
+    cost tens of bytes instead of the 20-45KB a full 300-line capture
+    runs; a full replacement is still sent automatically when a change
+    isn't a simple scroll (a clear, a redraw, an in-place progress bar)
+  * trustmux/pwa: serialize pane-switch subscribes to at most one in
+    flight. Flicking quickly through several panes with next/prev used
+    to subscribe to every pane landed on along the way -- each one a
+    real tmux capture and WebSocket send the daemon couldn't take back
+    once sent, even though the client discards any snapshot for a pane
+    it's already navigated past. An isolated tap still subscribes
+    immediately (no added latency); only a tap that lands while a
+    previous subscribe's snapshot hasn't arrived yet gets queued, and
+    only the latest such target is sent, the instant the outstanding one
+    resolves. Local UI (position label, breadcrumb, cached content)
+    still updates on every tap regardless
+  * trustmux/pwa: render OSC 8 hyperlinks (as emitted by `ls --hyperlink`,
+    git, ripgrep, and Claude Code's own CLI output) as clickable links
+    instead of silently discarding them -- the daemon already captured
+    them verbatim (capture-pane -e preserves OSC 8 byte for byte), only
+    the client-side renderer had nothing to do with them. Only
+    http(s)/mailto targets are ever linkified; any other scheme (e.g.
+    javascript:, data:) renders as plain text. Coupled to shell
+    integration for now: byobu-enable-shell-integration also aliases
+    `ls` to emit these links (--hyperlink=auto, only if ls isn't already
+    aliased and actually supports the flag), and
+    byobu-disable-shell-integration removes it along with everything
+    else -- one on/off switch for both, since there's no separate
+    opt-in yet
 
 byobu (7.18) 2026-08-14  Dustin Kirkland <kirkland@ubuntu.com>
 

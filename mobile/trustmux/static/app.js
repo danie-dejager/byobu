@@ -17,6 +17,71 @@ let statusInterval = null;
 const _paneCache = new Map();
 const _PANE_CACHE_MAX = 50;
 
+// Pane-switch subscribes are serialized to at most one in flight: a fresh
+// subscribe can't preempt one already sent (once write_message() has been
+// called daemon-side the bytes are committed -- cancelling afterward can't
+// unsend them), so sending a second one before the first's snapshot has
+// even arrived just queues more bytes behind it on the same slow link. If
+// nothing is outstanding, a new pane switch sends immediately -- zero
+// added latency for the common case of an isolated tap. If something is
+// still outstanding, only the *latest* target is remembered and sent the
+// moment the outstanding one resolves (its snapshot arrives), which is the
+// earliest point it's actually safe to send more. See _requestSubscribe's
+// call site in navigateTo for why this exists.
+let _subscribeInFlight = false;
+let _subscribeDeferredPaneId = null;
+let _subscribeSafetyTimer = null;
+// Backstop only: normally cleared the instant the in-flight snapshot
+// arrives. Guards against a subscribe that, for whatever reason, never
+// gets a reply (e.g. the pane died in the gap between tap and send),
+// which would otherwise wedge every subsequent navigation behind a flag
+// that never clears.
+const _SUBSCRIBE_SAFETY_MS = 15000;
+
+function _sendSubscribeNow(paneId) {
+  _subscribeInFlight = true;
+  _subscribeDeferredPaneId = null;
+  clearTimeout(_subscribeSafetyTimer);
+  _subscribeSafetyTimer = setTimeout(() => {
+    _subscribeInFlight = false;
+    if (_subscribeDeferredPaneId !== null) {
+      const target = _subscribeDeferredPaneId;
+      _subscribeDeferredPaneId = null;
+      _sendSubscribeNow(target);
+    }
+  }, _SUBSCRIBE_SAFETY_MS);
+  send({ type: 'subscribe', pane_id: paneId, lines: 300, ansi: true, join: wrapOn });
+}
+
+function _requestSubscribe(paneId) {
+  if (_subscribeInFlight) {
+    _subscribeDeferredPaneId = paneId; // supersedes any earlier deferred target
+  } else {
+    _sendSubscribeNow(paneId);
+  }
+}
+
+// Called whenever a subscribe's response has definitively arrived, so the
+// next queued navigation (if any) can go out immediately.
+function _subscribeSettled() {
+  _subscribeInFlight = false;
+  clearTimeout(_subscribeSafetyTimer);
+  if (_subscribeDeferredPaneId !== null) {
+    const target = _subscribeDeferredPaneId;
+    _subscribeDeferredPaneId = null;
+    _sendSubscribeNow(target);
+  }
+}
+
+// Raw (pre-render) lines of the currently displayed pane, so a "delta"
+// message (drop N lines off the top, append these at the bottom -- see
+// the daemon's _diff_pane_lines) can be applied without re-fetching the
+// whole pane. Tracked separately from _paneCache, which only ever holds
+// already-rendered HTML. _currentPaneRawLinesFor guards against applying
+// a delta meant for a pane we're no longer tracking raw lines for.
+let _currentPaneRawLines = [];
+let _currentPaneRawLinesFor = null;
+
 // ── offline / connectivity helpers ────────────────────────────────────────
 let _serverVersion = null;
 
@@ -171,6 +236,8 @@ const infoPopup       = document.getElementById('info-popup');
 const infoPopupHost   = document.getElementById('info-popup-host');
 const infoPopupBody   = document.getElementById('info-popup-body');
 const infoPopupReload = document.getElementById('info-popup-reload');
+const logoLink        = document.getElementById('logo-link');
+const aboutPopup      = document.getElementById('about-popup');
 const statuslineLeft   = document.getElementById('statusline-left');
 const statuslineRight  = document.getElementById('statusline-right');
 const ctxOverlay       = document.getElementById('ctx-overlay');
@@ -302,10 +369,17 @@ function connect() {
     _connectedAt = Date.now();
     startClock();
     send({ type: 'list_sessions' });
-    if (currentPane) send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+    if (currentPane) _sendSubscribeNow(currentPane);
   };
   ws.onclose = (evt) => {
     stopClock();
+    // In-flight tracking is scoped to one connection -- a subscribe sent
+    // on the old socket will never get a reply on the new one, so start
+    // clean rather than carrying a stale "in flight" flag (or a stale
+    // deferred target) across the reconnect.
+    _subscribeInFlight = false;
+    _subscribeDeferredPaneId = null;
+    clearTimeout(_subscribeSafetyTimer);
     if (evt.code === 4401) {
       showPairScreen();
       return;
@@ -340,7 +414,13 @@ function connect() {
         else renderCtxList();
       }
     } else if (msg.type === 'snapshot') {
+      // A snapshot is always the first (and only) reply to a subscribe,
+      // so its arrival is exactly the signal that it's now safe to send
+      // whatever navigation target queued up behind it, if any.
+      _subscribeSettled();
       if (msg.pane_id === currentPane) {
+        _currentPaneRawLines = msg.data.split('\n');
+        _currentPaneRawLinesFor = msg.pane_id;
         const forceTop = _scrollTopOnNextSnapshot;
         if (forceTop) _scrollTopOnNextSnapshot = false;
         const atBottom = output.scrollHeight - output.scrollTop <= output.clientHeight + 60;
@@ -349,8 +429,23 @@ function connect() {
       }
     } else if (msg.type === 'update') {
       if (msg.pane_id !== currentPane) return;
+      _currentPaneRawLines = msg.data.split('\n');
+      _currentPaneRawLinesFor = msg.pane_id;
       const atBottom = output.scrollHeight - output.scrollTop <= output.clientHeight + 60;
       renderOutput(msg.data, atBottom);
+    } else if (msg.type === 'delta') {
+      // Bandwidth-saving alternative to 'update': the daemon detected the
+      // pane's captured window merely slid down (old lines dropped off
+      // the top, new ones appended at the bottom -- the common case for
+      // a busy pane) and sent only what changed instead of the whole
+      // capture. If our tracked raw lines don't match this pane (e.g. a
+      // stream from a pane we've since switched away from), there's
+      // nothing safe to apply the delta to -- drop it and wait for the
+      // next snapshot rather than rendering a mismatched reconstruction.
+      if (msg.pane_id !== currentPane || _currentPaneRawLinesFor !== msg.pane_id) return;
+      _currentPaneRawLines = _currentPaneRawLines.slice(msg.drop).concat(msg.append);
+      const atBottom = output.scrollHeight - output.scrollTop <= output.clientHeight + 60;
+      renderOutput(_currentPaneRawLines.join('\n'), atBottom);
     } else if (msg.type === 'error') {
       setStatus(`error: ${msg.message}`, 'error');
     }
@@ -508,7 +603,13 @@ function navigateTo(sessionId, windowId, paneId) {
     output.textContent = 'loading…';
   }
 
-  send({ type: 'subscribe', pane_id: paneId, lines: 300, ansi: true, join: wrapOn });
+  // See _requestSubscribe: sends immediately if nothing's outstanding
+  // (the common case -- an isolated tap costs no added latency), or
+  // remembers this as the latest target and sends it the instant the
+  // outstanding subscribe's snapshot arrives, if one is already in
+  // flight. Everything above (cache restore, position label, breadcrumb)
+  // still updates instantly on every tap regardless.
+  _requestSubscribe(paneId);
   updateXYZLabel();
   updateContextName();
 }
@@ -580,8 +681,22 @@ const C16_LIGHT = [
   '#555753','#c81e1e','#1c7d1c','#7a6000','#2a65b0','#8f5a8a','#0c7878','#303030',
 ];
 
-// Convert ANSI SGR escape codes to HTML spans.
-// Handles: 16/256/truecolor fg+bg, bold, italic, underline. Other sequences discarded.
+// Schemes allowed in an OSC 8 hyperlink target. Deliberately an allowlist,
+// not a blocklist: pane content is whatever a remote command chose to
+// print, so a scheme this doesn't recognize (javascript:, data:, vscode:,
+// file: -- anything that could act rather than just navigate) renders as
+// plain text instead of a clickable target. http/https covers the vast
+// majority of real hyperlink-emitting tools (ls --hyperlink, git, ripgrep);
+// mailto is the other common one (git blame/log author addresses).
+const _SAFE_HYPERLINK_SCHEMES = /^(https?|mailto):/i;
+
+function _sanitizeHyperlinkUrl(url) {
+  return _SAFE_HYPERLINK_SCHEMES.test(url) ? url : null;
+}
+
+// Convert ANSI SGR escape codes and OSC 8 hyperlinks to HTML.
+// Handles: 16/256/truecolor fg+bg, bold, italic, underline, OSC 8 links.
+// Other sequences discarded.
 function ansiToHtml(text) {
   // Palette follows the active theme; renders are theme-baked, so a theme
   // switch clears _paneCache and resubscribes (see rerenderTerminal).
@@ -600,7 +715,8 @@ function ansiToHtml(text) {
     return (ok(r) && ok(g) && ok(b)) ? `rgb(${r},${g},${b})` : null;
   }
   let fg = null, bg = null, bold = false, italic = false, ul = false;
-  let spanCss = null, out = '';
+  let linkHref = null; // current OSC 8 target, or null when not inside a link
+  let spanCss = null, spanLinkHref = null, out = '';
 
   function css() {
     const p = [];
@@ -611,15 +727,36 @@ function ansiToHtml(text) {
     if (ul) p.push('text-decoration:underline');
     return p.join(';');
   }
+  function esc(s) {
+    // Also escapes " (harmless in text content, and required wherever esc()
+    // feeds the href="..." attribute below -- an unescaped quote in a URL
+    // would otherwise close the attribute early and let the rest of the
+    // URL string inject arbitrary markup).
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
   function emit(s) {
     if (!s) return;
+    // The <a> wrapper and the <span> style are independent axes (a link's
+    // text can still change color mid-link), so each is opened/closed on
+    // its own change -- but a span must close before its enclosing <a>
+    // does, so a link-boundary change always closes the span first.
+    if (linkHref !== spanLinkHref) {
+      if (spanCss !== null) { out += '</span>'; spanCss = null; }
+      if (spanLinkHref !== null) out += '</a>';
+      if (linkHref !== null) {
+        // title shows the real destination on long-press/hover: OSC 8 lets the
+        // link text say one host while the href goes to another.
+        out += `<a href="${esc(linkHref)}" title="${esc(linkHref)}" target="_blank" rel="noopener noreferrer">`;
+      }
+      spanLinkHref = linkHref;
+    }
     const c = css();
     if (c !== spanCss) {
       if (spanCss !== null) out += '</span>';
       if (c) out += `<span style="${c}">`;
       spanCss = c || null;
     }
-    out += s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    out += esc(s);
   }
   function sgr(ps) {
     let i = 0;
@@ -645,12 +782,26 @@ function ansiToHtml(text) {
       i++;
     }
   }
-  const TOK = /([^\x1b]+)|\x1b(?:\[([0-9;]*)([A-Za-z])|\][^\x07\x1b]*(?:\x07|\x1b\\)|(.))/g;
+  // OSC 8 body looks like "8;params;URI" -- an empty URI (just "8;;") is
+  // the spec's own close marker. params (e.g. id=NNN, used by some
+  // emitters to associate a link split across lines) is unused here: this
+  // renders each captured OSC 8 span independently, which needs no such
+  // grouping.
+  function osc8(body) {
+    const rest = body.slice(2); // drop leading "8"
+    const semi = rest.indexOf(';');
+    if (semi === -1) return;
+    const uri = rest.slice(semi + 1);
+    linkHref = uri ? _sanitizeHyperlinkUrl(uri) : null;
+  }
+  const TOK = /([^\x1b]+)|\x1b(?:\[([0-9;]*)([A-Za-z])|\]([^\x07\x1b]*)(?:\x07|\x1b\\)|(.))/g;
   for (const m of text.matchAll(TOK)) {
     if (m[1])              emit(m[1]);
     else if (m[3] === 'm') sgr(m[2] ? m[2].split(';').map(Number) : [0]);
+    else if (m[4] !== undefined && m[4].charAt(0) === '8') osc8(m[4]);
   }
   if (spanCss !== null) out += '</span>';
+  if (spanLinkHref !== null) out += '</a>';
   return out;
 }
 
@@ -769,7 +920,7 @@ function setKbdMode(mode) {
   wrapOn = (kbdMode === 1);
   if (currentPane) {
     _saveWrap(currentPane, wrapOn);
-    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+    _requestSubscribe(currentPane);
   }
   applyWrap();
   applyKbdMode();
@@ -857,7 +1008,7 @@ escapePopupWrap.addEventListener('click', () => {
   if (currentPane) {
     _saveWrap(currentPane, wrapOn);
     // Resubscribe so the snapshot is re-captured with the new join flag.
-    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+    _requestSubscribe(currentPane);
   }
   applyWrap();
   scrollOutputToBottom();
@@ -1326,8 +1477,12 @@ let _pendingPing = null; // resolver for an in-flight latency ping, or null
 
 // Round-trip latency via a dedicated ping/pong (not list_sessions — that
 // queries tmux, adding noise to a number meant to reflect network time).
-// Resolves to null if no pong arrives within 3s (matches how the rest of
-// the app treats a stalled connection).
+// Resolves to null if no pong arrives within LATENCY_TIMEOUT_MS. Well past
+// the connection's own stall threshold: a real link (e.g. plane wifi, or a
+// connection still working through a backed-up send queue) can be connected
+// but take tens of seconds to round-trip, and the popup should show that
+// number instead of "timed out".
+const LATENCY_TIMEOUT_MS = 60000;
 function measureLatency() {
   return new Promise(resolve => {
     if (_pendingPing) { resolve(null); return; }
@@ -1336,7 +1491,7 @@ function measureLatency() {
     send({ type: 'ping' });
     setTimeout(() => {
       if (_pendingPing) { _pendingPing = null; resolve(null); }
-    }, 3000);
+    }, LATENCY_TIMEOUT_MS);
   });
 }
 
@@ -1403,8 +1558,15 @@ function showPairScreen() {
   pairCodeInput.value = '';
   pairError.textContent = '';
   if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
-  const autoCode = (window.location.hash.slice(1) || '').replace(/\D/g, '').slice(0, 6);
-  if (autoCode && /^\d{6}$/.test(autoCode)) {
+  // Take the code out of the URL bar and history as soon as it has been
+  // read, whether or not pairing then succeeds; and only auto-submit a
+  // fragment that is exactly a code, so a stray link cannot spend a guess.
+  const fragment = window.location.hash.slice(1) || '';
+  if (window.location.hash) {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  }
+  const autoCode = /^\d{6}$/.test(fragment) ? fragment : '';
+  if (autoCode) {
     pairCodeInput.value = `${autoCode.slice(0,3)}-${autoCode.slice(3)}`;
     setTimeout(submitPair, 400);
   } else {
@@ -1597,6 +1759,26 @@ document.addEventListener('touchstart', e => {
   if (!infoPopup.contains(e.target) && !isTrigger) hideInfoPopup();
 }, { passive: true });
 
+// ── about popup (tap the logo or "Trustmux" wordmark) ──────────────────────
+function showAboutPopup() {
+  const rect = logoLink.getBoundingClientRect();
+  aboutPopup.style.display = 'block';
+  aboutPopup.style.top  = (rect.bottom + 8) + 'px';
+  aboutPopup.style.left = rect.left + 'px';
+}
+function hideAboutPopup() {
+  aboutPopup.style.display = 'none';
+}
+function toggleAboutPopup(e) {
+  e.stopPropagation();
+  aboutPopup.style.display === 'none' ? showAboutPopup() : hideAboutPopup();
+}
+logoLink.addEventListener('click', toggleAboutPopup);
+document.addEventListener('click', () => hideAboutPopup());
+document.addEventListener('touchstart', e => {
+  if (!aboutPopup.contains(e.target) && e.target !== logoLink && !logoLink.contains(e.target)) hideAboutPopup();
+}, { passive: true });
+
 function applyVersion(v) {
   if (!v) return;
   const isUpdate = _serverVersion && v !== _serverVersion;
@@ -1718,7 +1900,7 @@ function rerenderTerminal() {
     // join must ride every resubscribe: without it the daemon captures this
     // pane unjoined, and with wrap on the re-render hard-breaks long lines
     // at the tmux pane width until the next pane switch.
-    send({ type: 'subscribe', pane_id: currentPane, lines: 300, ansi: true, join: wrapOn });
+    _requestSubscribe(currentPane);
   }
 }
 

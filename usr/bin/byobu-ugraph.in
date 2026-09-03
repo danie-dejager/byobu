@@ -119,14 +119,15 @@ get_data()
     return
   fi
 
-  bytes=$(<${file})
+  bytes=$(<"$file")
   bytes=$(echo "$bytes"|tail -n ${needed_lines})
   [ $lines -eq $needed_lines -o $rotate = n ] && echo "$bytes" && return
 
-  # rotate
-  tmp=`tempfile`
-  echo "$bytes" > $tmp
-  mv $tmp $file
+  # rotate: write beside the file and rename over it, never through a
+  # predictable name someone else could have planted
+  tmp=$(mktemp "${file}.XXXXXX") || return
+  printf '%s\n' "$bytes" > "$tmp"
+  mv -f "$tmp" "$file"
 
   echo "$bytes"
 }
@@ -187,9 +188,11 @@ fi
 
 if [ -z "$file" ]
 then
-  # we could go cryptic+safe by calling tempfile(1), but that then
-  # makes it very difficult to find in case of need.
-  file=/tmp/${USER}-${script_name}-$$.dat
+  # No -f: the data only has to live for this one run.  A predictable
+  # /tmp/$USER-...-$$.dat let anyone pre-create it (or a symlink) for us to
+  # append to; mktemp cannot be pre-created.
+  file=$(mktemp "${TMPDIR:-/tmp}/${script_name}.XXXXXXXX") || exit 1
+  trap 'rm -f "$file"' EXIT HUP INT QUIT TERM
 fi
 
 [ -z "$min" ]    && min=$min_default
@@ -205,7 +208,8 @@ then
     exit 1
   fi
 
-  eval "$cmd >>$file"
+  # The command is the caller's to run; only the destination is ours to quote.
+  sh -c "$cmd" >> "$file"
 fi
 
 data=$(get_data)
@@ -214,5 +218,5 @@ data=$(get_data)
 
 for datum in $data
 do
-  byobu-ulevel -n -m $min -x $max -p -c $datum -t $theme
+  byobu-ulevel -n -m "$min" -x "$max" -p -c "$datum" -t "$theme"
 done

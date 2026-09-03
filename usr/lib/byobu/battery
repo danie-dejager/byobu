@@ -38,7 +38,7 @@ __battery_detail() {
 }
 
 __battery() {
-	local bat line present sign state percent full rem color bcolor dev BATTERY_STATUS
+	local bat line present sign state percent full rem color bcolor dev BATTERY_STATUS k v
 	# Linux support
 	present=""; full="0"; rem="0"; state=""
 	# OpenBSD support via apm(8)
@@ -61,27 +61,6 @@ __battery() {
 	if [ -z "$present" ]; then
 	for bat in $BATTERY /sys/class/power_supply/* /proc/acpi/battery/*; do
 		case "$bat" in
-			/sys/*)
-				if [ -r "$bat/uevent" ]; then
-					TMP_FILE=$(mktemp) || continue
-					trap 'rm -f "$TMP_FILE"' EXIT INT TERM
-					sed 's/=/="/; s/$/"/' < "$bat/uevent" > "$TMP_FILE"
-					. "$TMP_FILE"
-					rm -f "$TMP_FILE"
-					trap - EXIT INT TERM
-					case "$POWER_SUPPLY_NAME" in AC|ac|Ac|aC) continue ;; esac
-					present="$POWER_SUPPLY_PRESENT"
-					# Some use "CHARGE", others use "ENERGY", still others "CAPACITY"
-					[ -n "$POWER_SUPPLY_CHARGE_FULL" ] && full=$((POWER_SUPPLY_CHARGE_FULL+full))
-					[ -n "$POWER_SUPPLY_ENERGY_FULL" ] && full=$((POWER_SUPPLY_ENERGY_FULL+full))
-					[ -n "$POWER_SUPPLY_CHARGE_NOW" ] && rem=$((POWER_SUPPLY_CHARGE_NOW+rem))
-					[ -n "$POWER_SUPPLY_ENERGY_NOW" ] && rem=$((POWER_SUPPLY_ENERGY_NOW+rem))
-					if [ -n "$POWER_SUPPLY_CAPACITY" ] && [ ! -n "$POWER_SUPPLY_ENERGY_NOW" ] && [ ! -n "$POWER_SUPPLY_CHARGE_NOW" ]; then
-						rem="$POWER_SUPPLY_CAPACITY" && full="100"
-					fi
-					[ "$POWER_SUPPLY_STATUS" != "Unknown" ] && state="$POWER_SUPPLY_STATUS"
-				fi
-			;;
 			/proc/*)
 				[ -f "$bat/info" ] || continue
 				while read line; do
@@ -104,6 +83,50 @@ __battery() {
 					[ -n "$rem" -a -n "$state" ] && break
 				done < "$bat/state"
 				[ -n "$full" ] && [ -n "$rem" ] && [ -n "$state" ] && break
+			;;
+			*)
+				if [ -r "$bat/uevent" ]; then
+					# Parse uevent; never source it.  Values such as
+					# POWER_SUPPLY_MODEL_NAME and _SERIAL_NUMBER are copied
+					# verbatim by the kernel from device firmware (USB string
+					# descriptors for HID batteries and UPSes), so sourcing
+					# the file would run whatever a device chose to put there.
+					# Only the keys used below are read, numeric keys must be
+					# digits, and name/status must be a plain word.
+					POWER_SUPPLY_NAME=""; POWER_SUPPLY_STATUS=""; POWER_SUPPLY_PRESENT=""
+					POWER_SUPPLY_CHARGE_FULL=""; POWER_SUPPLY_ENERGY_FULL=""
+					POWER_SUPPLY_CHARGE_NOW=""; POWER_SUPPLY_ENERGY_NOW=""; POWER_SUPPLY_CAPACITY=""
+					while IFS='=' read -r k v; do
+						case "$k" in
+							POWER_SUPPLY_NAME|POWER_SUPPLY_STATUS)
+								case "$v" in ""|*[!A-Za-z0-9_.-]*) continue ;; esac ;;
+							POWER_SUPPLY_PRESENT|POWER_SUPPLY_CHARGE_FULL|POWER_SUPPLY_ENERGY_FULL|POWER_SUPPLY_CHARGE_NOW|POWER_SUPPLY_ENERGY_NOW|POWER_SUPPLY_CAPACITY)
+								case "$v" in ""|*[!0-9]*) continue ;; esac ;;
+							*) continue ;;
+						esac
+						case "$k" in
+							POWER_SUPPLY_NAME) POWER_SUPPLY_NAME="$v" ;;
+							POWER_SUPPLY_STATUS) POWER_SUPPLY_STATUS="$v" ;;
+							POWER_SUPPLY_PRESENT) POWER_SUPPLY_PRESENT="$v" ;;
+							POWER_SUPPLY_CHARGE_FULL) POWER_SUPPLY_CHARGE_FULL="$v" ;;
+							POWER_SUPPLY_ENERGY_FULL) POWER_SUPPLY_ENERGY_FULL="$v" ;;
+							POWER_SUPPLY_CHARGE_NOW) POWER_SUPPLY_CHARGE_NOW="$v" ;;
+							POWER_SUPPLY_ENERGY_NOW) POWER_SUPPLY_ENERGY_NOW="$v" ;;
+							POWER_SUPPLY_CAPACITY) POWER_SUPPLY_CAPACITY="$v" ;;
+						esac
+					done < "$bat/uevent"
+					case "$POWER_SUPPLY_NAME" in AC|ac|Ac|aC) continue ;; esac
+					present="$POWER_SUPPLY_PRESENT"
+					# Some use "CHARGE", others use "ENERGY", still others "CAPACITY"
+					[ -n "$POWER_SUPPLY_CHARGE_FULL" ] && full=$((POWER_SUPPLY_CHARGE_FULL+full))
+					[ -n "$POWER_SUPPLY_ENERGY_FULL" ] && full=$((POWER_SUPPLY_ENERGY_FULL+full))
+					[ -n "$POWER_SUPPLY_CHARGE_NOW" ] && rem=$((POWER_SUPPLY_CHARGE_NOW+rem))
+					[ -n "$POWER_SUPPLY_ENERGY_NOW" ] && rem=$((POWER_SUPPLY_ENERGY_NOW+rem))
+					if [ -n "$POWER_SUPPLY_CAPACITY" ] && [ ! -n "$POWER_SUPPLY_ENERGY_NOW" ] && [ ! -n "$POWER_SUPPLY_CHARGE_NOW" ]; then
+						rem="$POWER_SUPPLY_CAPACITY" && full="100"
+					fi
+					[ "$POWER_SUPPLY_STATUS" != "Unknown" ] && state="$POWER_SUPPLY_STATUS"
+				fi
 			;;
 		esac
 	done

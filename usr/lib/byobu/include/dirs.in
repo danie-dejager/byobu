@@ -55,6 +55,8 @@ if [ -d /dev/shm ] && [ -w /dev/shm ]; then
 	# Still empty, make a new one
 	if [ ! -d "$BYOBU_RUN_DIR" ] || [ ! -O "$BYOBU_RUN_DIR" ]; then
 		export BYOBU_RUN_DIR=$(mktemp -d /dev/shm/$PKG-$USER-XXXXXXXX)
+		# It holds scrollback dumps and status caches; keep them ours
+		chmod 700 "$BYOBU_RUN_DIR" 2>/dev/null || true
 	fi
 fi
 if [ ! -d "$BYOBU_RUN_DIR" ] || [ ! -O "$BYOBU_RUN_DIR" ] || [ ! -w "$BYOBU_RUN_DIR" ]; then
@@ -66,5 +68,5 @@ if [ ! -d "$BYOBU_RUN_DIR" ] || [ ! -O "$BYOBU_RUN_DIR" ] || [ ! -w "$BYOBU_RUN_
 		# But if not, we'll use a cache directory
 		export BYOBU_RUN_DIR="$HOME/.cache/$PKG"
 	fi
-	mkdir -p "$BYOBU_RUN_DIR" 2>/dev/null || true
+	mkdir -p -m 700 "$BYOBU_RUN_DIR" 2>/dev/null || true
 fi
