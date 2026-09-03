@@ -1605,6 +1605,17 @@ def main():
         sys.exit(0)
     args = parser.parse_args()
 
+    # The CLI refuses root (trustmux._ctl._refuse_root) but the daemon can be
+    # started by hand.  As root it would create root-owned state under /root,
+    # run tmux commands against root's server, and hold a TLS key and session
+    # tokens that the user's own `trustmux` can neither see nor revoke.
+    if os.geteuid() == 0 and not os.environ.get("TRUSTMUX_ALLOW_ROOT"):
+        print("Error: trustmuxd must not run as root; start it as the user whose "
+              "tmux sessions it should serve.", file=sys.stderr)
+        print("  (set TRUSTMUX_ALLOW_ROOT=1 to override, e.g. in a container "
+              "that only has root)", file=sys.stderr)
+        sys.exit(1)
+
     migrate_legacy_layout()
     inst = resolve_instance(args.name)
     if not check_sock_path(inst):

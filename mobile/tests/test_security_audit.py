@@ -407,3 +407,28 @@ class TestUnpairLabelSanitised(unittest.TestCase):
 
     def test_known_browsers_still_shortened(self):
         self.assertEqual(unpair._ua_short('Mozilla/5.0 ... Mobile Safari'), 'Mobile')
+
+
+class TestDaemonRefusesRoot(unittest.TestCase):
+    def _main(self, euid, env):
+        import sys
+        with patch.object(sys, 'argv', ['trustmuxd', '--port', '7432']), \
+             patch('trustmux._daemon.os.geteuid', return_value=euid), \
+             patch.dict(os.environ, env, clear=False), \
+             patch('trustmux._daemon.migrate_legacy_layout',
+                   side_effect=RuntimeError('reached startup')), \
+             patch('builtins.print'):
+            return bm.main()
+
+    def test_root_is_refused_before_touching_anything(self):
+        os.environ.pop('TRUSTMUX_ALLOW_ROOT', None)
+        with self.assertRaises(SystemExit) as cm:
+            self._main(0, {})
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_root_override_and_normal_user_proceed(self):
+        with self.assertRaisesRegex(RuntimeError, 'reached startup'):
+            self._main(0, {'TRUSTMUX_ALLOW_ROOT': '1'})
+        os.environ.pop('TRUSTMUX_ALLOW_ROOT', None)
+        with self.assertRaisesRegex(RuntimeError, 'reached startup'):
+            self._main(1000, {})
