@@ -428,23 +428,43 @@ def warn_if_peer_blocked(port: int = SERVE_PORT, stream=sys.stderr) -> None:
     print( "", file=stream)
 
 
-def _ensure_ts_serve(port: int = DEFAULT_PORT) -> bool:
-    """Configure tailscale serve for port. Returns True on success."""
+def _ts_serve_supports_unix() -> bool:
+    """True if this tailscale can proxy to a Unix socket (`serve unix:PATH`).
+
+    Probed from the CLI's own help text rather than a version table: the
+    feature is what matters, and the help names it when it is there.
+    """
+    try:
+        r = subprocess.run(["tailscale", "serve", "--help"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    return "unix:" in f"{r.stdout}\n{r.stderr}"
+
+
+def _serve_needle(target: str) -> str:
+    """What `tailscale serve status` shows for a target we configured."""
+    return target[len("unix:"):] if target.startswith("unix:") else f":{target}"
+
+
+def _ensure_ts_serve_target(target: str) -> bool:
+    """Configure tailscale serve to proxy https://<tailnet-name> to target,
+    a port number or unix:PATH. Returns True on success."""
     try:
         out = subprocess.check_output(
             ["tailscale", "serve", "status"],
             stderr=subprocess.DEVNULL, text=True,
         )
-        if f":{port}" in out:
-            print(f"✓ tailscale serve already configured for port {port}")
+        if _serve_needle(target) in out:
+            print(f"✓ tailscale serve already configured for {target}")
             return True
     except Exception:
         pass
 
-    print(f"Enabling tailscale serve (HTTPS → localhost:{port})...")
+    print(f"Enabling tailscale serve (HTTPS → {target})...")
     try:
         subprocess.run(
-            ["tailscale", "serve", "--bg", str(port)],
+            ["tailscale", "serve", "--bg", target],
             check=True, stderr=subprocess.DEVNULL,
         )
         print("✓ tailscale serve configured")
@@ -457,20 +477,28 @@ def _ensure_ts_serve(port: int = DEFAULT_PORT) -> bool:
     print("Error: could not configure tailscale serve.", file=sys.stderr)
     print("Your user needs Tailscale operator permission (one-time setup). Run:", file=sys.stderr)
     print(f"  sudo tailscale set --operator={user}", file=sys.stderr)
-    print(f"  tailscale serve --bg {port}", file=sys.stderr)
+    print(f"  tailscale serve --bg {target}", file=sys.stderr)
     print("Then re-run: trustmux start", file=sys.stderr)
     return False
 
 
-def _remove_ts_serve(port: int) -> bool:
-    """Remove the tailscale serve mapping for port. Returns True if gone.
+def _ensure_ts_serve(port: int = DEFAULT_PORT) -> bool:
+    """Configure tailscale serve for a loopback TCP port (older tailscale)."""
+    return _ensure_ts_serve_target(str(port))
 
-    A mapping that outlives the daemon keeps forwarding the tailnet name to a
-    loopback port nothing of ours is listening on -- which any other local user
-    could then bind, and be handed the phone's session cookie.
+
+def _remove_ts_serve(target: str) -> bool:
+    """Remove the tailscale serve mapping for target (port or unix:PATH).
+    Returns True if gone.
+
+    A mapping that outlives the daemon keeps forwarding the tailnet name to
+    something nothing of ours is listening on.  For a loopback port that is
+    dangerous -- any other local user could bind it and be handed the phone's
+    session cookie; for a Unix socket in our 0700 directory it is merely dead.
     """
+    target = str(target)
     try:
-        subprocess.run(["tailscale", "serve", "--bg", str(port), "off"],
+        subprocess.run(["tailscale", "serve", "--bg", target, "off"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=15)
         return True
@@ -479,26 +507,34 @@ def _remove_ts_serve(port: int) -> bool:
     try:
         out = subprocess.check_output(["tailscale", "serve", "status"],
                                       stderr=subprocess.DEVNULL, text=True, timeout=15)
-        if f":{port}" not in out:
+        if _serve_needle(target) not in out:
             return True     # already gone, whoever removed it
     except Exception:
         pass
-    print("Warning: could not remove the tailscale serve mapping for port "
-          f"{port}.", file=sys.stderr)
-    print("  Until the daemon is running again, that mapping forwards your tailnet "
-          "name to a loopback port", file=sys.stderr)
-    print("  any local user could bind. Remove it by hand:", file=sys.stderr)
-    print(f"    tailscale serve --bg {port} off      (or: tailscale serve reset)",
+    print(f"Warning: could not remove the tailscale serve mapping for {target}.",
+          file=sys.stderr)
+    if not target.startswith("unix:"):
+        print("  Until the daemon is running again, that mapping forwards your tailnet "
+              "name to a loopback port", file=sys.stderr)
+        print("  any local user could bind. Remove it by hand:", file=sys.stderr)
+    else:
+        print("  Remove it by hand:", file=sys.stderr)
+    print(f"    tailscale serve --bg {target} off      (or: tailscale serve reset)",
           file=sys.stderr)
     return False
 
 
-def _serve_marker_port(inst: Instance) -> int | None:
-    """Port recorded in this instance's serve marker, if it has one."""
+def _serve_marker_target(inst: Instance) -> str | None:
+    """Target recorded in this instance's serve marker: a port number or
+    unix:PATH, or None if it has none."""
     try:
-        return _valid_port(inst.serve_marker.read_text().strip())
+        target = inst.serve_marker.read_text().strip()
     except OSError:
         return None
+    if target.startswith("unix:") and len(target) > 5:
+        return target
+    port = _valid_port(target)
+    return str(port) if port else None
 
 
 def _launch(port: int, extra_args: list[str], inst: Instance | None = None) -> int | None:
@@ -698,13 +734,31 @@ def cmd_start(mode: str = "serve", port: int | None = None,
         if not ts_host:
             print("Error: cannot determine Tailscale hostname (is tailscale up?)", file=sys.stderr)
             return 1
-        if not _ensure_ts_serve(port):
-            return 1
         _ensure_dir(inst)
-        inst.serve_marker.write_text(f"{port}\n")
-        print("Starting trustmux (HTTPS mode)...")
-        pid = _launch(port, adv + ["--host", "127.0.0.1", "--https"], inst)
-        ok = pid is not None
+        if _ts_serve_supports_unix():
+            # The daemon listens on a socket in its own 0700 directory and
+            # tailscale serve proxies to that: no loopback port exists for
+            # another local user to bind while the daemon is down.  Launch
+            # first so the socket is there when the mapping is made.
+            target = f"unix:{inst.http_sock}"
+            print("Starting trustmux (HTTPS mode, Unix socket)...")
+            pid = _launch(port, adv + ["--unix", str(inst.http_sock), "--https"], inst)
+            ok = pid is not None
+            if ok and not _ensure_ts_serve_target(target):
+                os.kill(pid, signal.SIGTERM)
+                inst.pid_file.unlink(missing_ok=True)
+                return 1
+            if ok:
+                inst.serve_marker.write_text(f"{target}\n")
+        else:
+            # Older tailscale: plain HTTP on a loopback port, which the serve
+            # mapping must not outlive (see _remove_ts_serve).
+            if not _ensure_ts_serve(port):
+                return 1
+            inst.serve_marker.write_text(f"{port}\n")
+            print("Starting trustmux (HTTPS mode)...")
+            pid = _launch(port, adv + ["--host", "127.0.0.1", "--https"], inst)
+            ok = pid is not None
         if ok:
             print(f"trustmux started (pid {pid})")
             urls = advertised_urls(daemon_info(inst))
@@ -759,17 +813,19 @@ def cmd_start(mode: str = "serve", port: int | None = None,
 def _teardown_serve(inst: Instance, keep_serve: bool) -> None:
     """After a stop: remove the serve mapping this instance set up, unless asked
     to keep it, in which case say what keeping it means."""
-    served = _serve_marker_port(inst)
+    served = _serve_marker_target(inst)
     if served is None:
         return
     if keep_serve:
+        where = served if served.startswith("unix:") else f"127.0.0.1:{served}"
         print(f"Note: tailscale serve still forwards https://<tailnet-name> to "
-              f"127.0.0.1:{served} with nothing listening.")
-        print("  On a shared host another user could bind that port. "
-              f"Start again soon, or run: trustmux stop{inst.label()}")
+              f"{where} with nothing listening.")
+        if not served.startswith("unix:"):
+            print("  On a shared host another user could bind that port. "
+                  f"Start again soon, or run: trustmux stop{inst.label()}")
         return
     if _remove_ts_serve(served):
-        print(f"tailscale serve mapping for port {served} removed "
+        print(f"tailscale serve mapping for {served} removed "
               "(start will recreate it)")
         inst.serve_marker.unlink(missing_ok=True)
 
@@ -840,7 +896,7 @@ def cmd_status(port: int | None = None, inst: Instance | None = None) -> int:
             print("  Run 'trustmux restart' to move it to the new one.")
             return 0
         print("trustmux not running")
-        served = _serve_marker_port(inst)
+        served = _serve_marker_target(inst)
         if served is not None:
             try:
                 out = subprocess.check_output(["tailscale", "serve", "status"],
@@ -848,11 +904,13 @@ def cmd_status(port: int | None = None, inst: Instance | None = None) -> int:
                                               timeout=15)
             except Exception:
                 out = ""
-            if f":{served}" in out:
+            if _serve_needle(served) in out:
+                where = served if served.startswith("unix:") else f"127.0.0.1:{served}"
                 print(f"Warning: tailscale serve still forwards https://<tailnet-name> "
-                      f"to 127.0.0.1:{served}, where nothing is listening.")
-                print("  On a shared host another user could bind that port and "
-                      "receive your phone's session cookie.")
+                      f"to {where}, where nothing is listening.")
+                if not served.startswith("unix:"):
+                    print("  On a shared host another user could bind that port and "
+                          "receive your phone's session cookie.")
                 print(f"  Run: trustmux start{inst.label()}   or   "
                       f"trustmux stop{inst.label()}  (removes the mapping)")
             else:
@@ -872,7 +930,7 @@ def cmd_status(port: int | None = None, inst: Instance | None = None) -> int:
                 ["tailscale", "serve", "status"],
                 stderr=subprocess.DEVNULL, text=True,
             )
-            if f":{port}" in out:
+            if f":{port}" in out or str(inst.http_sock) in out:
                 ts_host = _ts_host()
                 if ts_host:
                     print(f"Connect: https://{ts_host}")

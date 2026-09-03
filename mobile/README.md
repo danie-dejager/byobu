@@ -229,6 +229,7 @@ instance. `<I>` below is the `--name` name, or `default`.
 | `$XDG_STATE_HOME/trustmux/instances/<I>/cert.pem`, `key.pem` | Self-signed TLS keypair for `start-direct` |
 | `$XDG_STATE_HOME/trustmux/instances/<I>/trustmux.log` | Daemon log (mode 0600) |
 | `$XDG_STATE_HOME/trustmux/instances/<I>/trustmux.sock` | Admin Unix socket (mode 0600) |
+| `$XDG_STATE_HOME/trustmux/instances/<I>/http.sock` | HTTP listener in `start` mode, proxied by `tailscale serve` (mode 0600) |
 | `$XDG_STATE_HOME/trustmux/instances/<I>/trustmux.pid` | PID file — `<pid> <port>` |
 
 Defaults are `~/.config` and `~/.local/state`. Config holds only the files you
@@ -275,21 +276,24 @@ case a daemon predating the upgrade is still serving on it.
 
 ## Security
 
-- In the default mode the daemon binds to `127.0.0.1` only — not reachable from the network
+- In the default mode the daemon listens on a Unix socket inside its 0700
+  state directory (`http.sock`, mode 0600) and `tailscale serve` proxies to
+  it; nothing is bound on any TCP port, so there is nothing another local
+  user could bind in its place. With a tailscale too old for `serve unix:`
+  it falls back to plain HTTP on `127.0.0.1`, still unreachable from the
+  network
 - All traffic encrypted by Tailscale WireGuard; HTTPS via `tailscale serve`
 - No relay server — terminal data never leaves your Tailscale mesh
 - Pairing codes: 6-digit, 60-second TTL, single-use, 3 wrong guesses per
   address and 9 in total before the code is void; cross-site browser
   requests to the pairing endpoint are refused
 - Session tokens: 256-bit random, stored at mode 0600
-- `stop` removes the `tailscale serve` mapping it created. In `start` mode the
-  daemon is plain HTTP on 127.0.0.1, and a mapping left pointing at that port
-  while nothing listens would let another local user bind it and receive your
-  phone's session cookie. `stop --keep-serve` keeps it anyway; `status` warns
-  while a mapping points at nothing. Between boot and your first login the
-  mapping exists and the daemon does not, so on a host shared with people you
-  do not trust prefer `start-local` or a systemd user unit that starts it at
-  boot.
+- `stop` removes the `tailscale serve` mapping it created. This matters most
+  on the loopback fallback: a mapping left pointing at a TCP port while
+  nothing listens would let another local user bind it and receive your
+  phone's session cookie. With the Unix socket a stale mapping is merely
+  dead. `stop --keep-serve` keeps it anyway; `status` warns while a mapping
+  points at nothing.
 - The `start-direct` self-signed keypair is kept across restarts; `status`
   prints its SHA-256 fingerprint so a browser's certificate warning can be
   checked against it rather than clicked through
