@@ -1165,12 +1165,19 @@ byobu.overrideAttrs (old: { src = /src; })
 NIXEOF
 
 echo "--- Build step ---"
-su nixuser -c '
+# nixpkgs is pinned to a commit rather than the moving nixpkgs-unstable
+# channel, so the build is the same today as when it last passed and a
+# compromised or merely broken channel cannot change what this smoke test
+# runs.  Bump NIXPKGS_REV deliberately (git ls-remote
+# https://github.com/NixOS/nixpkgs nixpkgs-unstable) when the byobu
+# derivation in nixpkgs changes.
+NIXPKGS_REV=e8be7818e19ada32105a8af937a6a473b38167ca   # nixpkgs-unstable 2026-08-29
+su nixuser -c "
 . /home/nixuser/.nix-profile/etc/profile.d/nix.sh
-nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs
+nix-channel --add https://github.com/NixOS/nixpkgs/archive/$NIXPKGS_REV.tar.gz nixpkgs
 nix-channel --update
 nix-build /tmp/local-byobu.nix -o /tmp/result
-'
+"
 echo "--- Build PASSED ($(ls /tmp/result/bin | wc -l) binaries) ---"
 
 echo "--- Smoke: byobu test suite (Nix-built, local source) ---"
