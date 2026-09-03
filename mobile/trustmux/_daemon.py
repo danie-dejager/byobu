@@ -22,6 +22,7 @@ from pathlib import Path
 
 import tornado.httpserver
 import tornado.iostream
+import tornado.netutil
 import tornado.web
 import tornado.websocket
 
@@ -1564,7 +1565,6 @@ async def _amain(host: str, port: int, https: bool, ssl_ctx=None,
         # tailscale serve connects to this as root, so 0600 inside the 0700
         # state directory keeps every other local user out -- there is no
         # loopback port for anyone to bind while we are down.
-        import tornado.netutil
         INSTANCE.ensure_dirs()
         server.add_socket(tornado.netutil.bind_unix_socket(unix, mode=0o600))
     else:

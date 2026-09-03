@@ -18,6 +18,21 @@ lost, just relocated to where all distributions can use it.
 
 byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
 
+  * mobile/trustmux/_daemon.py: fix UnboundLocalError on every daemon
+    start. The Unix-socket serve-mode commit added `import
+    tornado.netutil` inside `_amain`'s `if unix:` branch; Python treats
+    any name imported/assigned anywhere in a function body as local to
+    the *whole* function, so the earlier, unconditional
+    `tornado.httpserver.HTTPServer(...)` call -- which runs regardless
+    of whether unix-socket mode is even used -- broke in every mode,
+    not just the new one. The PR's own test for this didn't catch it
+    because it re-implemented the same tornado calls inline rather than
+    calling the real `_amain()`, so it validated the concept without
+    exercising the actual code path the bug was in. Moved the import to
+    the module's existing top-level tornado imports. Verified against
+    a real failure this caused across all four packaging smoke tests
+    (pip, Homebrew, .deb, RPM) and confirmed fixed end-to-end via the
+    same pip/Chainguard-Wolfi path that failed
   * mobile: security: raise the tornado floor to 6.5.8, closing three
     Dependabot advisories: GHSA-mpf4-983q-p7j4 (high -- urlencoded body
     parsing omits max_num_fields, can stall the event loop),
