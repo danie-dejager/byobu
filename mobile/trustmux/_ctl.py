@@ -447,36 +447,77 @@ def _serve_needle(target: str) -> str:
     return target[len("unix:"):] if target.startswith("unix:") else f":{target}"
 
 
-def _ensure_ts_serve_target(target: str) -> bool:
-    """Configure tailscale serve to proxy https://<tailnet-name> to target,
-    a port number or unix:PATH. Returns True on success."""
+# tailscale enforces a stricter bar for a serve target that is a Unix socket
+# or filesystem path than for a plain TCP port: the operator flag alone
+# (tailscale set --operator=user) is sufficient for a port, but serving a
+# socket/path additionally requires the caller to be root or able to run
+# 'sudo tailscale' non-interactively. Confirmed directly against a real
+# tailscaled (1.102.2): the identical operator-only user that serves a port
+# with zero prompts gets "401 Unauthorized: must be root, or be an operator
+# and able to run 'sudo tailscale' to serve a path or Unix socket" for a
+# unix: target. _ts_serve_supports_unix() only checks the CLI version
+# understands unix: syntax at all -- it says nothing about whether *this
+# user* is currently allowed to use it, which is a separate, stricter
+# condition this substring detects so callers can fall back gracefully
+# instead of breaking a setup that worked fine before Unix-socket mode
+# existed.
+_UNIX_SERVE_NEEDS_SUDO = "able to run 'sudo tailscale'"
+
+
+def _try_ts_serve_target(target: str) -> tuple[bool, bool, str]:
+    """Attempt to configure tailscale serve for target; returns (ok,
+    already_configured, stderr). Prints nothing -- callers decide how to
+    report failure, since a Unix-socket target's failure may call for a
+    fallback rather than an error."""
     try:
         out = subprocess.check_output(
             ["tailscale", "serve", "status"],
             stderr=subprocess.DEVNULL, text=True,
         )
         if _serve_needle(target) in out:
-            print(f"✓ tailscale serve already configured for {target}")
-            return True
+            return True, True, ""
     except Exception:
         pass
-
-    print(f"Enabling tailscale serve (HTTPS → {target})...")
     try:
-        subprocess.run(
-            ["tailscale", "serve", "--bg", target],
-            check=True, stderr=subprocess.DEVNULL,
-        )
+        r = subprocess.run(["tailscale", "serve", "--bg", target],
+                           capture_output=True, text=True)
+        return r.returncode == 0, False, r.stderr
+    except Exception as e:
+        # No check=True here (unlike the status probe above): the return
+        # code is inspected directly so a real, non-mocked failure never
+        # raises in the first place. This still tolerates one raising
+        # anyway -- e.g. subprocess.CalledProcessError, which carries its
+        # own .stderr when captured -- rather than propagating an
+        # uncaught exception out of what the rest of this module treats
+        # as a plain (ok, ...) result.
+        return False, False, getattr(e, "stderr", "") or ""
+
+
+def _ensure_ts_serve_target(target: str) -> bool:
+    """Configure tailscale serve to proxy https://<tailnet-name> to target,
+    a port number or unix:PATH. Returns True on success; prints an error
+    (with an accurate hint for the target type) on failure."""
+    ok, already, err = _try_ts_serve_target(target)
+    if already:
+        print(f"✓ tailscale serve already configured for {target}")
+        return True
+    print(f"Enabling tailscale serve (HTTPS → {target})...")
+    if ok:
         print("✓ tailscale serve configured")
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
 
     user = os.environ.get("USER", "")
     print("", file=sys.stderr)
     print("Error: could not configure tailscale serve.", file=sys.stderr)
-    print("Your user needs Tailscale operator permission (one-time setup). Run:", file=sys.stderr)
-    print(f"  sudo tailscale set --operator={user}", file=sys.stderr)
+    if target.startswith("unix:") and _UNIX_SERVE_NEEDS_SUDO in err:
+        print("Serving a Unix socket needs more than operator permission: your user must", file=sys.stderr)
+        print("also be able to run 'sudo tailscale' without a password prompt. Either:", file=sys.stderr)
+        print(f"  echo '{user} ALL=(root) NOPASSWD: /usr/bin/tailscale' | sudo tee /etc/sudoers.d/tailscale-{user}", file=sys.stderr)
+        print("  chmod 440 /etc/sudoers.d/tailscale-" + user, file=sys.stderr)
+        print("or trustmux will fall back to serving a loopback port instead.", file=sys.stderr)
+    else:
+        print("Your user needs Tailscale operator permission (one-time setup). Run:", file=sys.stderr)
+        print(f"  sudo tailscale set --operator={user}", file=sys.stderr)
     print(f"  tailscale serve --bg {target}", file=sys.stderr)
     print("Then re-run: trustmux start", file=sys.stderr)
     return False
@@ -735,7 +776,8 @@ def cmd_start(mode: str = "serve", port: int | None = None,
             print("Error: cannot determine Tailscale hostname (is tailscale up?)", file=sys.stderr)
             return 1
         _ensure_dir(inst)
-        if _ts_serve_supports_unix():
+        use_unix = _ts_serve_supports_unix()
+        if use_unix:
             # The daemon listens on a socket in its own 0700 directory and
             # tailscale serve proxies to that: no loopback port exists for
             # another local user to bind while the daemon is down.  Launch
@@ -743,22 +785,41 @@ def cmd_start(mode: str = "serve", port: int | None = None,
             target = f"unix:{inst.http_sock}"
             print("Starting trustmux (HTTPS mode, Unix socket)...")
             pid = _launch(port, adv + ["--unix", str(inst.http_sock), "--https"], inst)
-            ok = pid is not None
-            if ok and not _ensure_ts_serve_target(target):
+            if pid is None:
+                return 1
+            serve_ok, already, err = _try_ts_serve_target(target)
+            if serve_ok:
+                print(f"✓ tailscale serve {'already configured' if already else 'configured'}")
+                inst.serve_marker.write_text(f"{target}\n")
+            elif _UNIX_SERVE_NEEDS_SUDO in err:
+                # Operator permission (already required, and already set up
+                # for anyone who has used serve mode before) covers a plain
+                # port but not a Unix socket -- that needs 'sudo tailscale'
+                # access too. Falling back rather than failing here keeps a
+                # setup that worked before Unix-socket mode existed working;
+                # see _ensure_ts_serve_target's error text for how to grant
+                # the extra permission and get the stronger protection.
+                print("Note: this tailscale needs 'sudo tailscale' access to serve a Unix "
+                      "socket (operator permission alone covers a loopback port, not a "
+                      "socket) -- falling back to a loopback port.", file=sys.stderr)
+                os.kill(pid, signal.SIGTERM)
+                inst.pid_file.unlink(missing_ok=True)
+                use_unix = False
+            else:
+                _ensure_ts_serve_target(target)  # reprint accurately, for a real error
                 os.kill(pid, signal.SIGTERM)
                 inst.pid_file.unlink(missing_ok=True)
                 return 1
-            if ok:
-                inst.serve_marker.write_text(f"{target}\n")
-        else:
-            # Older tailscale: plain HTTP on a loopback port, which the serve
-            # mapping must not outlive (see _remove_ts_serve).
+        if not use_unix:
+            # Older tailscale, or a Unix socket this user isn't permitted to
+            # serve: plain HTTP on a loopback port, which the serve mapping
+            # must not outlive (see _remove_ts_serve).
             if not _ensure_ts_serve(port):
                 return 1
             inst.serve_marker.write_text(f"{port}\n")
             print("Starting trustmux (HTTPS mode)...")
             pid = _launch(port, adv + ["--host", "127.0.0.1", "--https"], inst)
-            ok = pid is not None
+        ok = pid is not None
         if ok:
             print(f"trustmux started (pid {pid})")
             urls = advertised_urls(daemon_info(inst))
