@@ -1,0 +1,20 @@
+# Keeps the commit-SHA pins in .github/workflows current.  The publish job
+# holds id-token: write for PyPI, so its actions are pinned by SHA rather
+# than tag; without this nothing would ever move them forward.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: pip
+    directory: /mobile
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "mobile"
+    # uv.lock is authoritative and release.py checks the floors against it;
+    # this only surfaces advisories for the pinned requirements.txt.
+    open-pull-requests-limit: 3

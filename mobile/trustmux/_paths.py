@@ -115,6 +115,13 @@ class Instance:
         return self.state / "trustmux.pid"
 
     @property
+    def http_sock(self) -> Path:
+        """HTTP listener for serve mode, when tailscale can proxy to a Unix
+        socket.  Lives in the 0700 state directory, so unlike a loopback TCP
+        port there is nothing another local user could bind in its place."""
+        return self.state / "http.sock"
+
+    @property
     def serve_marker(self) -> Path:
         """Present while this instance owns a `tailscale serve` mapping.
 

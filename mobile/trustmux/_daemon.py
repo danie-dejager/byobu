@@ -22,6 +22,7 @@ from pathlib import Path
 
 import tornado.httpserver
 import tornado.iostream
+import tornado.netutil
 import tornado.web
 import tornado.websocket
 
@@ -1268,6 +1269,7 @@ async def _handle_admin(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "scheme":    _listen.get("scheme", ""),
                 "advertise": _listen.get("advertise", []),
                 "fingerprint": _cert_fingerprint,
+                "unix":      _listen.get("unix", ""),
             }
 
         elif action == "pair_generate":
@@ -1537,12 +1539,15 @@ def _ensure_self_signed_cert(lan_ip: str, advertised: Sequence[str] = ()) -> tup
 
 
 async def _amain(host: str, port: int, https: bool, ssl_ctx=None,
-                 advertise: Sequence[str] = ()) -> None:
+                 advertise: Sequence[str] = (), unix: str = "") -> None:
     global _https_mode, _listen
     _https_mode = https or ssl_ctx is not None
     _listen = {
-        "host":   host,
+        "host":   host if not unix else "",
+        # In Unix-socket mode the port is nominal: nothing is bound to it, but
+        # the CLI still identifies this daemon by it (pid file, `stop --port`).
         "port":   port,
+        "unix":   unix,
         # --https means tailscale serve terminates TLS in front of us, so the
         # URL a client uses is https even though this socket is plain HTTP.
         "scheme": "https" if _https_mode else "http",
@@ -1556,7 +1561,14 @@ async def _amain(host: str, port: int, https: bool, ssl_ctx=None,
     server = tornado.httpserver.HTTPServer(app, xheaders=https,
                                            ssl_options=ssl_ctx,
                                            max_body_size=65536)
-    server.listen(port, address=host)
+    if unix:
+        # tailscale serve connects to this as root, so 0600 inside the 0700
+        # state directory keeps every other local user out -- there is no
+        # loopback port for anyone to bind while we are down.
+        INSTANCE.ensure_dirs()
+        server.add_socket(tornado.netutil.bind_unix_socket(unix, mode=0o600))
+    else:
+        server.listen(port, address=host)
     admin_task = asyncio.create_task(_run_admin_server())
     try:
         await asyncio.Event().wait()   # run until cancelled (Ctrl-C / SIGTERM)
@@ -1567,6 +1579,8 @@ async def _amain(host: str, port: int, https: bool, ssl_ctx=None,
         except asyncio.CancelledError:
             pass
         server.stop()
+        if unix:
+            Path(unix).unlink(missing_ok=True)
 
 
 def main():
@@ -1584,6 +1598,10 @@ def main():
                         help="Port (default: 7432)")
     parser.add_argument("--https", action="store_true",
                         help="HTTPS mode: Secure cookie + trust proxy headers (use with tailscale serve)")
+    parser.add_argument("--unix", metavar="PATH", default="",
+                        help="Listen on this Unix socket instead of a TCP port "
+                             "(for `tailscale serve unix:PATH`); --port then only "
+                             "names the daemon")
     parser.add_argument("--self-signed", action="store_true",
                         help="Generate a self-signed TLS cert for direct HTTPS without Tailscale")
     parser.add_argument("--name", metavar="NAME", default=None,
@@ -1605,6 +1623,17 @@ def main():
         sys.exit(0)
     args = parser.parse_args()
 
+    # The CLI refuses root (trustmux._ctl._refuse_root) but the daemon can be
+    # started by hand.  As root it would create root-owned state under /root,
+    # run tmux commands against root's server, and hold a TLS key and session
+    # tokens that the user's own `trustmux` can neither see nor revoke.
+    if os.geteuid() == 0 and not os.environ.get("TRUSTMUX_ALLOW_ROOT"):
+        print("Error: trustmuxd must not run as root; start it as the user whose "
+              "tmux sessions it should serve.", file=sys.stderr)
+        print("  (set TRUSTMUX_ALLOW_ROOT=1 to override, e.g. in a container "
+              "that only has root)", file=sys.stderr)
+        sys.exit(1)
+
     migrate_legacy_layout()
     inst = resolve_instance(args.name)
     if not check_sock_path(inst):
@@ -1624,7 +1653,9 @@ def main():
     _load_tokens()
 
     host = args.host
-    if not host:
+    if args.unix:
+        host = ""
+    elif not host:
         if args.https:
             host = "127.0.0.1"
             print("Trustmux: HTTPS mode — binding to localhost (tailscale serve proxy)")
@@ -1666,9 +1697,10 @@ def main():
             pass
         _, ssl_ctx = _ensure_self_signed_cert(lan_ip, [a.host for a in advertised])
 
-    print(f"Trustmux daemon on {scheme}://{host}:{args.port} — run 'trustmux-pair' to pair a device.", flush=True)
+    where = f"unix:{args.unix}" if args.unix else f"{scheme}://{host}:{args.port}"
+    print(f"Trustmux daemon on {where} — run 'trustmux-pair' to pair a device.", flush=True)
     asyncio.run(_amain(host, args.port, args.https, ssl_ctx,
-                       [a.url for a in advertised]))
+                       [a.url for a in advertised], unix=args.unix))
 
 
 if __name__ == "__main__":

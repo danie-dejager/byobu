@@ -18,6 +18,41 @@ lost, just relocated to where all distributions can use it.
 
 byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
 
+  * mobile/trustmux/_ctl.py: fix `trustmux start` failing outright when
+    Unix-socket serve mode is available but the current user can't
+    actually use it. tailscale enforces a stricter bar for serving a
+    Unix socket/path than a plain TCP port: operator permission alone
+    (already required, already set up for anyone who used serve mode
+    before) covers a port, but a socket additionally needs the caller
+    to be root or able to run 'sudo tailscale' non-interactively --
+    confirmed directly against a real tailscaled (1.102.2), where the
+    identical operator-only user serves a port with zero prompts but
+    gets a 401 for a unix: target. `_ts_serve_supports_unix()` only
+    checked the CLI version understands unix: syntax, never whether
+    this user is currently allowed to use it, so Unix-socket mode broke
+    every operator-only setup that worked fine before it existed. Now
+    falls back to the loopback-port path automatically on that specific
+    permission error, with a message explaining how to grant the extra
+    sudo access if the stronger Unix-socket protection is wanted; any
+    other failure still errors as before. Verified against the real
+    failure end-to-end (not just the added unit tests): `trustmux
+    start` now succeeds, falling back and printing the note, on this
+    exact machine/tailscale version
+  * mobile/trustmux/_daemon.py: fix UnboundLocalError on every daemon
+    start. The Unix-socket serve-mode commit added `import
+    tornado.netutil` inside `_amain`'s `if unix:` branch; Python treats
+    any name imported/assigned anywhere in a function body as local to
+    the *whole* function, so the earlier, unconditional
+    `tornado.httpserver.HTTPServer(...)` call -- which runs regardless
+    of whether unix-socket mode is even used -- broke in every mode,
+    not just the new one. The PR's own test for this didn't catch it
+    because it re-implemented the same tornado calls inline rather than
+    calling the real `_amain()`, so it validated the concept without
+    exercising the actual code path the bug was in. Moved the import to
+    the module's existing top-level tornado imports. Verified against
+    a real failure this caused across all four packaging smoke tests
+    (pip, Homebrew, .deb, RPM) and confirmed fixed end-to-end via the
+    same pip/Chainguard-Wolfi path that failed
   * mobile: security: raise the tornado floor to 6.5.8, closing three
     Dependabot advisories: GHSA-mpf4-983q-p7j4 (high -- urlencoded body
     parsing omits max_num_fields, can stall the event loop),
@@ -30,6 +65,19 @@ byobu (7.19) 2026-08-15  Dustin Kirkland <kirkland@ubuntu.com>
     of pyproject.toml/uv.lock and Dependabot doesn't parse Ruby resource
     blocks (the exact class of gap release.py's
     check_homebrew_resources_fresh() exists to catch)
+  * security: follow-ups to the 2026-09 audit
+    - trustmux: in "start" (tailscale serve) mode the daemon now listens on
+      a Unix socket in its 0700 state directory and tailscale serve proxies
+      to it, so no loopback TCP port exists for another local user to bind
+      while the daemon is down; falls back to 127.0.0.1 on a tailscale too
+      old for "serve unix:"
+    - trustmux: trustmuxd refuses to run as root (TRUSTMUX_ALLOW_ROOT
+      overrides)
+    - release.py: before pinning a Homebrew formula to a PyPI sdist or a
+      GitHub release tarball, verify file by file that it is the source
+      built here; pin nixpkgs to a commit in the Nix smoke test
+    - Dependabot keeps the GitHub Actions SHA pins and requirements.txt
+      current
   * usr/bin/tmpfsffs: removed. Never actually shipped in any package
     (missing from dist_bin_SCRIPTS since it was added) and was always a
     proof-of-concept, not a real part of byobu -- rather than fix its

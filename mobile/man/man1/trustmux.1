@@ -411,6 +411,13 @@ and
 .B status
 to ask the daemon which port it is on.
 .TP
+.I $XDG_STATE_HOME/trustmux/instances/INSTANCE/http.sock
+HTTP listener in
+.B start
+mode (mode 0600), which
+.B tailscale serve
+proxies the tailnet name to; removed when the daemon exits.
+.TP
 .I $XDG_STATE_HOME/trustmux/instances/INSTANCE/trustmux.pid
 PID file written at daemon startup, holding
 .RI \(dq pid " " port \(dq.
@@ -575,21 +582,22 @@ endpoint is unreachable from the public internet or from other local-network
 devices.
 Behind
 .BR "tailscale serve" ,
-the daemon is plain HTTP on 127.0.0.1 and it is the serve mapping that carries
-the tailnet name to it.
-A mapping left in place while the daemon is not listening would forward the
-tailnet -- and the phone's session cookie -- to whichever local user binds that
-loopback port first, so
+the daemon listens on a Unix socket in its state directory
+.RI ( http.sock ,
+mode 0600 inside a 0700 directory) and the serve mapping carries the tailnet
+name to it; no TCP port is bound, so there is nothing another local user could
+bind in its place while the daemon is down.
+When the installed tailscale cannot proxy to a Unix socket, the daemon falls
+back to plain HTTP on 127.0.0.1.
+On that fallback a mapping left in place while the daemon is not listening
+would forward the tailnet -- and the phone's session cookie -- to whichever
+local user binds the loopback port first, so
 .B stop
 removes the mapping it created
 .RB ( "\-\-keep\-serve"
 leaves it), and
 .B status
 warns while a mapping points at nothing.
-Between boot and the first login the mapping exists and the daemon does not; on
-a host shared with untrusted users, prefer
-.B start\-local
-or start the daemon from a systemd user unit at boot.
 In
 .B start\-direct
 mode the daemon binds on all interfaces; the pairing-code and session-token
